@@ -19,6 +19,9 @@ from mne.decoding import Vectorizer
 from mne.io import concatenate_raws, read_raw_edf
 from mne.datasets import eegbci
 from mne.decoding import CSP
+from mne.preprocessing import ICA
+
+from autoreject import AutoReject
 
 # XDF file format support in MNE
 import pyxdf
@@ -28,7 +31,7 @@ from mne_import_xdf import *
 from sklearn.metrics import f1_score
 from sklearn.pipeline import make_pipeline, Pipeline
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis 
 from sklearn.svm import SVC  # Support Vector Classifier
 from sklearn.multiclass import OneVsOneClassifier
@@ -58,7 +61,6 @@ get_ipython().run_line_magic('matplotlib', 'qt')
 #imports for precision_recall_curve related plot: 
 from sklearn.preprocessing import label_binarize
 from sklearn.metrics import average_precision_score, precision_recall_curve,PrecisionRecallDisplay
-from sklearn.preprocessing import label_binarize
 from itertools import cycle
 import matplotlib.pyplot as plt
 import pickle
@@ -169,7 +171,7 @@ def get_subject_bad_electrodes(subject):
                     'sub-Roei': {'TP9'},
                     'Or': {'FT9','T7','FC2','FT7','Iz'},
                     'Roei-MI': {'FT10', 'TP10','P2','AF8','AF7','AF4'},
-                    'Fudge':{'Iz'},
+                    'Fudge':{'Iz','FT10', 'TP10', 'FT9', 'TP9','F1'},
                     'g': {'T7','CP1','TP9','P7','PO7'},
                     'Ron': {'Iz'}                   }
     if subject in bad_elecs_dict.keys():
@@ -265,16 +267,16 @@ def run_pre_processing_extract_validation_set(recording_path,current_path,params
         Raw.drop_channels(list(elecs_to_drop))
     Raw.drop_channels(Raw.info['bads'])
     Raw.set_eeg_reference(ref_channels="average")
-    # Do csd: 
-    if (PerformCsd):
-        print('\n###########################################################')
-        print('running csd')
-        Raw_CSD = mne.preprocessing.compute_current_source_density(Raw) ## Compute CSD
-    else :
-        print('\n###########################################################')
-        print('not using csd')
-        mne.set_eeg_reference(Raw, copy=False)
-        Raw_CSD =Raw
+    # # Do csd: 
+    # if (PerformCsd):
+    #     print('\n###########################################################')
+    #     print('running csd')
+    #     Raw_CSD = mne.preprocessing.compute_current_source_density(Raw) ## Compute CSD
+    # else :
+    print('\n###########################################################')
+    print('not using csd')
+    mne.set_eeg_reference(Raw, copy=False)
+    Raw_CSD =Raw
     print('\n###########################################################')
     print('filtering the data')  
    # Raw_CSD.pick= (params_dict['Electorde_Group'])
@@ -293,7 +295,7 @@ def run_pre_processing_extract_validation_set(recording_path,current_path,params
     print('\n###########################################################')
     print('extracting event info:',event_dict)
     
-    events_trigger_dict = {key: event_dict[key] for key in event_dict.keys() if key in desired_events}
+    events_trigger_dict = {key: event_dict[key] for key in event_dict.keys() if key in params_dict['desired_events']}
     print('\n###########################################################')
     filtered_electrodes  = [elec for elec in params_dict['Electorde_Group'] if elec not in elecs_to_drop]
     selected_elecs=filtered_electrodes
@@ -302,7 +304,7 @@ def run_pre_processing_extract_validation_set(recording_path,current_path,params
     filter_bank_epochs=[]
     for filtered_data_band in filtered_data_band_passed:
         filtered_data_band_raw = mne.io.RawArray(filtered_data_band,unfiltered_Raw_CSD.info)
-        epochs = mne.Epochs(filtered_data_band_raw, events_from_annot, picks = selected_elecs, preload = True,baseline= None, tmin=tmin, tmax=tmax, event_id=events_trigger_dict,detrend=0)
+        epochs = mne.Epochs(filtered_data_band_raw, events_from_annot, preload = True,baseline= None, tmin=tmin, tmax=tmax, event_id=events_trigger_dict,detrend=0)
         # Calculate the mean across epochs for the current event
         mean_across_epochs = epochs.get_data().mean(axis=0)
         event_data = epochs.get_data()         
@@ -312,17 +314,23 @@ def run_pre_processing_extract_validation_set(recording_path,current_path,params
         epochs = mne.EpochsArray(centered_event_data, epochs.info, events=event_epochs, event_id=epochs.event_id, tmin=epochs.tmin)
         filter_bank_epochs.append(epochs)
         
-
-    print(f'epoching + selecting current electodes set for analysis:\n{selected_elecs}')
-    epochs = mne.Epochs(Raw_CSD_Filtered, events_from_annot,picks = selected_elecs, preload = True,baseline= None, tmin=tmin, tmax=tmax, event_id=events_trigger_dict,detrend=0)
     
+    print(f'epoching + selecting current electodes set for analysis:\n{selected_elecs}')
+    epochs = mne.Epochs(Raw_CSD_Filtered, events_from_annot, preload = True,baseline= None, tmin=tmin, tmax=tmax, event_id=events_trigger_dict,detrend=0)
+    
+
+    #ar = AutoReject()
+    #epochs = ar.fit_transform(epochs)  
+
+    epochs = mne.preprocessing.compute_current_source_density(epochs)
+    epochs.pick(selected_elecs)
     ## Centering the data
 
     centered_data_list = []
     events_list = []
     mean_across_epochs = epochs.get_data().mean(axis=0)
     # Loop through each event ID
-    for idx,event_id in enumerate(desired_events):
+    for idx,event_id in enumerate(params_dict['desired_events']):
         print (event_id)
         # Extract epochs for the current event
         event_epochs = epochs[event_id]
@@ -352,8 +360,6 @@ def run_pre_processing_extract_validation_set(recording_path,current_path,params
     # Create a new EpochsArray with the centered data
     centered_epochs = mne.EpochsArray(centered_data, epochs.info, events=combined_events, event_id=epochs.event_id, tmin=epochs.tmin)
     epochs = centered_epochs
-
-
 
     #this section drops electrodes after epoching: but currently we drop all bad electrodes from the raw data
     print('\n###########################################################')
@@ -417,7 +423,7 @@ def crop_the_data(epochs,train_inds,validation_inds,full_epoch_tmin=0,full_epoch
     validation_Set_labels_uncroped=epochs.events[validation_inds,-1]
 
     #crop the epochs (use the epochs structure)
-    epochs_cropped = epochs.copy().crop(tmin=full_epoch_tmin, tmax=full_epoch_tmax)
+    epochs_cropped = epochs.copy().crop(tmin=tmin, tmax=tmax)
 
     #from here on - we extract the data as matrices (not epoch object anymore):
 
@@ -439,51 +445,36 @@ def crop_the_data(epochs,train_inds,validation_inds,full_epoch_tmin=0,full_epoch
                 'validation_set_data':validation_set_data,
                 'validation_set_labels':validation_set_labels}
     return return_dict
-def plot_accuracy_over_time(scores_windows, w_times, params_dict=None, axes_handle=None):
-    import numpy as np
-    import pandas as pd
-    import seaborn as sns
-    import matplotlib.pyplot as plt
 
-    # Validate inputs
-    if params_dict is None:
-        params_dict = {}
-    if axes_handle is None:
-        _, axes_handle = plt.subplots()
-    # Extract the number of classes from params_dict or default to 3
-    num_classes = len(desired_events)
-    chance_level = 1 / num_classes  # Calculate chance level dynamically
+def augment_data(augmentation_params,data_x_to_augment,y,sfreq):
+    #do augmentation: 
+    if (augmentation_params['win_step']==0 or augmentation_params['win_len']==0): #check if augmentation is not requested/invalid:
+        augmented_x=data_x_to_augment
+        augmented_y=y
+    else: #augmentation requested
+        #set up the augmentation window boundaries based on the augmentation paramaters:                      
+        aug_epochs_s=np.arange(0,data_x_to_augment.shape[2],augmentation_params['win_step']*sfreq)
+        aug_epochs_e=np.array([a+augmentation_params['win_len']*sfreq for a in aug_epochs_s])
+        #remove start and ends that exceeds the relevant epoch lengths: 
+        aug_epochs_s=aug_epochs_s[aug_epochs_e<data_x_to_augment.shape[2]]
+        aug_epochs_e=aug_epochs_e[aug_epochs_e<data_x_to_augment.shape[2]]
 
-    # Convert scores_windows to long-form DataFrame
-    # Adjust the time range (extend to 5 seconds)
-    times_col_names = [np.round(w_times[s], 2) for s in range(len(w_times))]
-    scores_windows_array = np.squeeze(np.array(scores_windows))
-    if scores_windows_array.shape[1] != len(w_times):
-        raise ValueError("Mismatch between scores_windows columns and w_times length.")
-    
-    scores_windows_df = pd.DataFrame(columns=times_col_names, data=scores_windows_array)
-    scores_windows_df['fold_id'] = range(len(scores_windows_df))
-    longform_scores_windows_df = pd.melt(scores_windows_df, id_vars='fold_id', 
-                                         value_vars=scores_windows_df.columns)
-    longform_scores_windows_df.rename(columns={'variable': 'Time', 'value': 'Accuracy'}, inplace=True)
+        #pile all augmented (sub windows) to have the regular structure of epochs (>original due to augmentation,channels,samples)
+        data_fold_x_augmented=[]
+        data_fold_y_augmented=[]
+        for aug_s,aug_e in zip(aug_epochs_s,aug_epochs_e):
+            if len(data_x_to_augment.shape)==3:
+                data_x_in_cur_window=data_x_to_augment[:,:,int(aug_s):int(aug_e)]
+            elif len(data_x_to_augment.shape)==4: #with filterbank: 
+                data_x_in_cur_window=data_x_to_augment[:,:,int(aug_s):int(aug_e),:]
+            data_y_in_cur_window=y
+            data_fold_x_augmented.append(data_x_in_cur_window)
+            data_fold_y_augmented.append(data_y_in_cur_window)
 
-    # Plot using seaborn
-    sns.lineplot(data=longform_scores_windows_df, x='Time', y='Accuracy', ax=axes_handle)
+        augmented_x=np.concatenate(data_fold_x_augmented,axis=0)
+        augmented_y=np.concatenate(data_fold_y_augmented)
+    return augmented_x,augmented_y
 
-    # Add onset and chance lines
-    if any(w_times > 0):
-        onset_location = np.round(w_times[w_times >= 0][0], 2)
-        axes_handle.axvline(onset_location, linestyle='--', color='k', label='Onset') 
-    axes_handle.axhline(chance_level, linestyle='-', color='k', label='Chance') 
-
-    # Customize the plot
-    axes_handle.set_xlabel('Time (s)')
-    axes_handle.set_ylabel('Classification Accuracy')
-    axes_handle.set_title('Classification Score Over Time')
-    axes_handle.set_ylim([0.2, 1])
-    axes_handle.set_xlim([-2, 5])  # Adjust the x-axis limits to extend to 5 seconds
-    axes_handle.legend()
-    axes_handle.grid(True)
 
 class ShallowFBCSPNetWrapper:
     def __init__(self, n_channels, n_classes, sfreq, n_times, input_window_seconds=None, learning_rate=0.001, n_epochs=10, batch_size=32):
@@ -553,7 +544,9 @@ def run_windowed_classification_on_fold(fold_train_data_x,fold_train_data_y,fold
     if curr_classifier_name=='csp+lda':  
         #define the classifier components:  
         lda = LinearDiscriminantAnalysis()
-        csp = CSP(n_components=params_dict['n_components'], reg=None, log=True, norm_trace=True)
+        csp = CSP(n_components=params_dict['n_components'], reg='ledoit_wolf', log=True, norm_trace=False)
+        # Define a scaler (choose one based on data characteristics)
+        scaler = RobustScaler()  # OR use RobustScaler() if you have outliers
         #define the pipeline: 
         clf = Pipeline([('csp',csp),('classifier_LDA',lda)])
     elif curr_classifier_name == 'shallowfbcspnet':
@@ -626,7 +619,6 @@ def run_windowed_classification_on_fold(fold_train_data_x,fold_train_data_y,fold
     fold_test_data_y_labels=np.array([triggers_label_dict[cur_y] for cur_y in fold_test_data_y])
     if BinaryClassification:
         combined_labels_test = np.array(['motor_imagery' if label in [A, B] else label for label in fold_test_data_y_labels])
-
         fold_windowed_scores,confusion_metrices_per_window=run_windowed_pretrained_classifier(clf,fold_test_data_x_uncroped,combined_labels_test,w_start,w_length)
     else:
         fold_windowed_scores,confusion_metrices_per_window=run_windowed_pretrained_classifier(clf,fold_test_data_x_uncroped,fold_test_data_y_labels,w_start,w_length)
@@ -640,55 +632,68 @@ def run_windowed_pretrained_classifier(clf,x_uncropped,y,w_start,w_length):
     for n in w_start:
         fold_data=np.squeeze(x_uncropped[:, :, n:(n + w_length),:]) #using squeeze here so that if the 4th dimention size is 1 it will reduce it to a 3d vector
         #if the classifier uses a filterbank its input should be 4d (trials,channels,timesteps,filter_bands) and if it doesnt its 3d (trials,channels,timesteps)
-        # Get predictions
-        predictions = clf.predict(fold_data)
         fold_score_on_time_window=clf.score(fold_data, y)
-        #fold_score_on_time_window=f1_score(y, predictions, average='micro', zero_division=0)
         #append the score for the LDA, using this csp to predict the relevant test scores: 
         scores_per_time_window.append(fold_score_on_time_window)
         confusion_mat=confusion_matrix(y,clf.predict(fold_data),labels=clf.classes_)
         confusion_metrices_per_window.append(confusion_mat)
     return scores_per_time_window,confusion_metrices_per_window
 
-def augment_data(augmentation_params,data_x_to_augment,y,sfreq):
-    #do augmentation: 
-    if (augmentation_params['win_step']==0 or augmentation_params['win_len']==0): #check if augmentation is not requested/invalid:
-        augmented_x=data_x_to_augment
-        augmented_y=y
-    else: #augmentation requested
-        #set up the augmentation window boundaries based on the augmentation paramaters:                      
-        aug_epochs_s=np.arange(0,data_x_to_augment.shape[2],augmentation_params['win_step']*sfreq)
-        aug_epochs_e=np.array([a+augmentation_params['win_len']*sfreq for a in aug_epochs_s])
-        #remove start and ends that exceeds the relevant epoch lengths: 
-        aug_epochs_s=aug_epochs_s[aug_epochs_e<data_x_to_augment.shape[2]]
-        aug_epochs_e=aug_epochs_e[aug_epochs_e<data_x_to_augment.shape[2]]
+def plot_accuracy_over_time(scores_windows, w_times, params_dict=None, axes_handle=None):
+    import numpy as np
+    import pandas as pd
+    import seaborn as sns
+    import matplotlib.pyplot as plt
 
-        #pile all augmented (sub windows) to have the regular structure of epochs (>original due to augmentation,channels,samples)
-        data_fold_x_augmented=[]
-        data_fold_y_augmented=[]
-        for aug_s,aug_e in zip(aug_epochs_s,aug_epochs_e):
-            if len(data_x_to_augment.shape)==3:
-                data_x_in_cur_window=data_x_to_augment[:,:,int(aug_s):int(aug_e)]
-            elif len(data_x_to_augment.shape)==4: #with filterbank: 
-                data_x_in_cur_window=data_x_to_augment[:,:,int(aug_s):int(aug_e),:]
-            data_y_in_cur_window=y
-            data_fold_x_augmented.append(data_x_in_cur_window)
-            data_fold_y_augmented.append(data_y_in_cur_window)
+    # Validate inputs
+    if params_dict is None:
+        params_dict = {}
+    if axes_handle is None:
+        _, axes_handle = plt.subplots()
+    # Extract the number of classes from params_dict or default to 3
+    num_classes = len(params_dict['desired_events'])
+    chance_level = 1 / num_classes  # Calculate chance level dynamically
 
-        augmented_x=np.concatenate(data_fold_x_augmented,axis=0)
-        augmented_y=np.concatenate(data_fold_y_augmented)
-    return augmented_x,augmented_y
+    # Convert scores_windows to long-form DataFrame
+    # Adjust the time range (extend to 5 seconds)
+    times_col_names = [np.round(w_times[s], 2) for s in range(len(w_times))]
+    scores_windows_array = np.squeeze(np.array(scores_windows))
+    if scores_windows_array.shape[1] != len(w_times):
+        raise ValueError("Mismatch between scores_windows columns and w_times length.")
+    
+    scores_windows_df = pd.DataFrame(columns=times_col_names, data=scores_windows_array)
+    scores_windows_df['fold_id'] = range(len(scores_windows_df))
+    longform_scores_windows_df = pd.melt(scores_windows_df, id_vars='fold_id', 
+                                         value_vars=scores_windows_df.columns)
+    longform_scores_windows_df.rename(columns={'variable': 'Time', 'value': 'Accuracy'}, inplace=True)
+
+    # Plot using seaborn
+    sns.lineplot(data=longform_scores_windows_df, x='Time', y='Accuracy', ax=axes_handle)
+
+    # Add onset and chance lines
+    if any(w_times > 0):
+        onset_location = np.round(w_times[w_times >= 0][0], 2)
+        axes_handle.axvline(onset_location, linestyle='--', color='k', label='Onset') 
+    axes_handle.axhline(chance_level, linestyle='-', color='k', label='Chance') 
+
+    # Customize the plot
+    axes_handle.set_xlabel('Time (s)')
+    axes_handle.set_ylabel('Classification Accuracy')
+    axes_handle.set_title('Classification Score Over Time')
+    axes_handle.set_ylim([0.2, 1])
+    axes_handle.set_xlim([-2, 5])  # Adjust the x-axis limits to extend to 5 seconds
+    axes_handle.legend()
+    axes_handle.grid(True)
 
 def run_windowed_classification_aug_cv(epochs_cropped,cv_split,train_set_data,train_set_labels,train_set_data_uncroped,params_dict, BinaryClassification):
     augmentation_params=params_dict['augmentation_params']
     windowed_prediction_params=params_dict['windowed_prediction_params']
     win_len=windowed_prediction_params['win_len']
     win_step=windowed_prediction_params['win_step']
-    
     sfreq = epochs_cropped.info['sfreq']
     w_length = int(sfreq * win_len)   # running classifier: window length
     w_step = int(sfreq * win_step)  # running classifier: window step size
-    w_start = np.arange(0, train_set_data_uncroped.shape[2] + 500- w_length, w_step)
+    w_start = np.arange(0, train_set_data_uncroped.shape[2] - w_length, w_step)
     print('uncroped train set length = ',train_set_data_uncroped.shape[2])
 
     scores_windows = []
@@ -775,7 +780,7 @@ def run_training_and_classification_on_selected_params(params_dict,preprocessing
 
     #get scores over time using CV: 
     scores_windows,folds_confusion_metrices_per_window,w_times=run_windowed_classification_aug_cv(epochs_cropped,cv_split,train_set_data,train_set_labels,train_set_data_uncropped,params_dict, BinaryClassification)
-    
+    #scores_windows,folds_confusion_metrices_per_window,w_times,trained_clf=run_windowed_classification_aug(epochs_cropped,train_set_data,train_set_labels,validation_set_data_uncropped,validation_set_labels,params_dict, BinaryClassification)
     #train the classifier based on ALL training data, and test its prediction on the unseen validation set: 
     validaiton_scores,validation_confusion_metrices_per_window,_,trained_clf=run_windowed_classification_aug(epochs_cropped,train_set_data,train_set_labels,validation_set_data_uncropped,validation_set_labels,params_dict, BinaryClassification)
     if to_plot:
@@ -1067,45 +1072,43 @@ def TEST_plot_precision_recall_curves_from_trained_classifier(predict_test,epcoh
 # From here, everything works with the same functions that run on single participants
 
 # Select relevant events for epoching
-desired_events = ['ActiveRest','OpenPalm'] 
 # Define which subject to currently check: 
-for recording_file,Subject in zip(recording_files[7:9],subject_names[7:9]):
+for recording_file,Subject in zip(recording_files[4:7],subject_names[4:7]):
     print(recording_file,Subject)
-
-#this code is custom to aggregate all 3 of roi recordings into a single processing_dict structure. 
 
 #####################################################
 #define manually paramaters that we wish to change: 
-#get all possible grid_search combinations: 
-iteration_ind=0 #select some grid search combination - you can manualy change the params after getting the "params_dict" below
-grid_search_dict_copy=grid_search_dict.copy()
-all_grid_combinations = list(itertools.product(*all_options))
-#here i can change manually the current iteration params: 
-grid_search_dict_copy['Electorde_Groups_names_grid']=['AF+F+C+CP+PO']
-grid_search_dict_copy['filters_bands']=[[[7, 12], [12, 20], [20, 28], [28, 35]]]#[[[8,12], [12, 16],[16,20],[20,24],[24,28],[28,32]]]
-#this cell allow to test specific iterations
-params_dict=set_up_params_for_current_grid_iteration(all_grid_combinations,iteration_ind,grid_search_dict_copy)
+params_dict={}
 params_dict['subject']=Subject
 params_dict['recording_file']=recording_file
 params_dict['PerformCsd']=True
+Electorde_Group_Names='F+FC+C+CP+P'
+params_dict['Electorde_Group']=[]
+for cur_elec_group_name in Electorde_Group_Names.split('+'):
+    params_dict['Electorde_Group']=params_dict['Electorde_Group']+Electorde_Groups[cur_elec_group_name]
 params_dict['filter_method']='fir'
 params_dict['epoch_tmins_and_maxes_grid'] = [-3,5]
-params_dict['n_components']= 4
+params_dict['epoch_tmin'] = -3
+params_dict['epoch_tmax'] = 5
+params_dict['n_components']= 8
 params_dict['LowPass']=5
 params_dict['HighPass']=35
+params_dict['filters_bands']=[[7, 12], [12, 20], [20, 28], [28, 35]]
 params_dict['augmentation_params']={'win_len': 1, 'win_step': 0.1}
-params_dict['classifier_window_s']=0
-params_dict['classifier_window_e']=4
+params_dict['classifier_window_s']=1
+params_dict['classifier_window_e']=3
 params_dict['windowed_prediction_params']={'win_len': 2, 'win_step': 0.1}
 params_dict['pipeline_name']='csp+lda'
 params_dict['n_components_fbcsp']=4
+params_dict['desired_events'] = ['ActiveRest','OpenPalm','ClosePalm'] 
+
 
 BinaryClassification = False
 
 ##########################preprocess each of the recording seperately#########################
 preprocessing_dicts=[]
 
-for recording_file,subject in zip(recording_files[7:9],subject_names[7:9]):
+for recording_file,subject in zip(recording_files[4:7],subject_names[4:7]):
     print(recording_file,subject)
     params_dict['recording_file']=recording_file
     train_inds,validation_inds,preprocessing_dict,mean_across_epochs=run_pre_processing_extract_validation_set(recording_path,current_path,params_dict)
@@ -1154,7 +1157,7 @@ fig,w_times,scores_windows,folds_confusion_metrices_per_window,validation_scores
 #%%
 # Plot the precision recall curve, and extract the relevant decision information into a dataframe
 
-return_df=plot_precision_recall_curves_from_trained_classifier(combined_preprocessing_dict,params_dict,precision_recall_curve_timerange=[0,2],trained_clf=trained_clf,predict_validation=True)
+return_df=plot_precision_recall_curves_from_trained_classifier(combined_preprocessing_dict,params_dict,precision_recall_curve_timerange=[1,3],trained_clf=trained_clf,predict_validation=True)
 print(return_df)
 
 if True: 
@@ -1282,7 +1285,7 @@ for filtered_data_band in filtered_data_band_passed:
 current_path = pathlib.Path().absolute()  
 recording_path = current_path / 'Recordings'
 
-OriginalRaw=read_raw_xdf(recording_path / 'Ron_3rd_MI_03.xdf')
+OriginalRaw=read_raw_xdf(recording_path / 'Fudge_MI3_1.xdf')
 OriginalRaw.drop_channels(['ACC_X','ACC_Y','ACC_Z']) ## Drop non eeg channels
 #mne.rename_channels(OriginalRaw.info, {'F9' : 'FT9','P9' : 'TP9','P10' : 'TP10','F10' : 'FT10','AF1' : 'AF7' }, allow_duplicates=False, verbose=None)
 unfiltered_OriginalRaw = OriginalRaw.copy()
@@ -1296,7 +1299,7 @@ elecs_to_remove=get_subject_bad_electrodes(subject)
 
 filtered_electrodes  = [elec for elec in params_dict['Electorde_Group'] if elec not in elecs_to_remove]
 selected_elecs=filtered_electrodes
-Original_Raw_CSD = mne.preprocessing.compute_current_source_density(unfiltered_OriginalRaw) ## Compute CSD
+Original_Raw_CSD = unfiltered_OriginalRaw
 OriginalRaw_Filtered = Original_Raw_CSD.filter(5, 35, method='fir')
 events_from_annot,event_dict = mne.events_from_annotations(unfiltered_OriginalRaw)
 desired_events = ['ActiveRest','ClosePalm'] 
