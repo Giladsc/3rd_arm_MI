@@ -146,7 +146,7 @@ def classifier_training(fold_train_data_x,fold_train_data_y,params_dict, BinaryC
         #define the classifier components:  
         lda = LinearDiscriminantAnalysis()
         csp = CSP(n_components=params_dict['n_components'], reg='oas', log=True, norm_trace=True)
-        scaler = StandardScaler()  # OR use RobustScaler() if you have outliers
+        scaler = StandardScaler() 
 
         
 
