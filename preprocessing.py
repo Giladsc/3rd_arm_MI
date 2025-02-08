@@ -368,10 +368,10 @@ def crop_the_data(epochs,train_inds,validation_inds,tmin,tmax,full_epoch_tmin=0,
     validation_set_data=epochs_cropped.get_data()[validation_inds]
     validation_set_labels=epochs_cropped.events[validation_inds,-1]
 
-    return_dict={'train_set_data_uncroped':train_set_data_uncroped,
+    return_dict={'train_set_data_uncropped':train_set_data_uncroped,
                 'train_set_labels_uncroped':train_set_labels_uncroped,
-                'validation_set_data_uncroped':validation_set_data_uncroped,
-                'validation_Set_labels_uncroped':validation_Set_labels_uncroped,
+                'validation_set_data_uncropped':validation_set_data_uncroped,
+                'validation_Set_labels_uncropped':validation_Set_labels_uncroped,
                 'epochs_cropped':epochs_cropped,
                 'train_set_data':train_set_data,
                 'train_set_labels':train_set_labels,

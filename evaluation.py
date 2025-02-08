@@ -78,7 +78,7 @@ import torch
 
 
 
-from preprocessing import *
+
 from training import *
 #%%
 def plot_accuracy_over_time(scores_windows, w_times, params_dict=None, axes_handle=None):
@@ -243,33 +243,11 @@ def plot_precision_recall_curves_from_trained_classifier(preprocessing_dict,para
 
     return return_df
 
-def run_windowed_classification_aug_cv(epochs_cropped,cv_split,train_set_data,train_set_labels,train_set_data_uncroped,params_dict, BinaryClassification):
-    augmentation_params=params_dict['augmentation_params']
-    windowed_prediction_params=params_dict['windowed_prediction_params']
-    win_len=windowed_prediction_params['win_len']
-    win_step=windowed_prediction_params['win_step']
-    sfreq = epochs_cropped.info['sfreq']
-    w_length = int(sfreq * win_len)   # running classifier: window length
-    w_step = int(sfreq * win_step)  # running classifier: window step size
-    w_start = np.arange(0, train_set_data_uncroped.shape[2] - w_length, w_step)
-    print('uncroped train set length = ',train_set_data_uncroped.shape[2])
 
-    scores_windows = []
-    folds_confusion_metrices_per_window=[]
-    #this section first extracts each CV fold, only then it augments it (to avoid data leakage)
-    for train_idx, test_idx in cv_split:
-        #seperate the cv fold for labels - train-test:
-        y_train, y_test = train_set_labels[train_idx], train_set_labels[test_idx] 
-        #seperate the cv fold for features information: 
-        if len(train_set_data.shape)==3:
-            data_fold_x_train_to_augment = train_set_data[train_idx,:,:]
-        elif len(train_set_data.shape)==4: #there are filter bank info in the data: 
-            data_fold_x_train_to_augment = train_set_data[train_idx,:,:,:] 
-        #do augmentation: 
-        augmented_x,augmented_y=augment_data(augmentation_params,data_fold_x_train_to_augment,y_train,sfreq)
-        #run classifier on the data fold
-        curr_scores_windows,confusion_metrices_per_window,_=run_windowed_classification_on_fold(augmented_x,augmented_y,train_set_data_uncroped[test_idx],y_test,params_dict,w_start,w_length, BinaryClassification)         
-        scores_windows.append(curr_scores_windows)
-        folds_confusion_metrices_per_window.append(confusion_metrices_per_window)
-    w_times = (w_start + w_length / 2.) / sfreq + params_dict['epoch_tmin']
-    return scores_windows,folds_confusion_metrices_per_window,w_times
+def plot_confusion_matrix(conf_mat, class_labels, title="Confusion Matrix"):
+    plt.figure(figsize=(6,5))
+    sns.heatmap(conf_mat, annot=True, fmt='d', cmap='Blues', xticklabels=class_labels, yticklabels=class_labels)
+    plt.xlabel("Predicted Labels")
+    plt.ylabel("True Labels")
+    plt.title(title)
+    plt.show()
