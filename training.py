@@ -18,7 +18,6 @@ from mne import Epochs,find_events
 from mne.decoding import Vectorizer
 from mne.io import concatenate_raws, read_raw_edf
 from mne.datasets import eegbci
-from mne.decoding import CSP
 
 # XDF file format support in MNE
 import pyxdf
@@ -142,14 +141,12 @@ class ShallowFBCSPNetWrapper:
 def classifier_training(fold_train_data_x,fold_train_data_y,params_dict, BinaryClassification = False):
     #note that this is currently the  function that really does the classification and extracts the performence measure (the previous calls to run_lda.... for example, are just tests)
     curr_classifier_name=params_dict['pipeline_name']
+    csp = lda = None
     if curr_classifier_name=='csp+lda':  
         #define the classifier components:  
         lda = LinearDiscriminantAnalysis()
         csp = CSP(n_components=params_dict['n_components'], reg='oas', log=True, norm_trace=True)
         scaler = StandardScaler() 
-
-        
-
         #define the pipeline: 
         clf = Pipeline([('csp',csp),('scaler', scaler), ('classifier_LDA',lda)])
     elif curr_classifier_name == 'shallowfbcspnet':
@@ -185,11 +182,11 @@ def classifier_training(fold_train_data_x,fold_train_data_y,params_dict, BinaryC
         clf = Pipeline([('csp',csp), ('ovo_svm', OneVsOneClassifier(SVC(kernel='linear', random_state=42)))])
     elif curr_classifier_name=='ts+lda':
         #define the classifier components:  
-        covest = Covariances()
+        cov = Covariances(estimator="lwf")
         ts = TangentSpace()
         lda = LinearDiscriminantAnalysis()
         #define the pipeline: 
-        clf = Pipeline([('conv',covest),('ts', ts), ('LDA', lda)])
+        clf = Pipeline([('cov',cov),('ts', ts), ('LDA', lda)])
     elif curr_classifier_name=='fbcsp+lda':
         #define the classifier components: 
         lda = LinearDiscriminantAnalysis()
