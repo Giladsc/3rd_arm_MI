@@ -1082,7 +1082,7 @@ params_dict={}
 params_dict['subject']=Subject
 params_dict['recording_file']=recording_file
 params_dict['PerformCsd']=True
-Electorde_Group_Names='F+FC+C+CP+P'
+Electorde_Group_Names='F+C+CP+P'
 params_dict['Electorde_Group']=[]
 for cur_elec_group_name in Electorde_Group_Names.split('+'):
     params_dict['Electorde_Group']=params_dict['Electorde_Group']+Electorde_Groups[cur_elec_group_name]

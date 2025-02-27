@@ -156,7 +156,7 @@ def get_subject_bad_electrodes(subject):
                     'Roei-MI': {'FT10', 'TP10','P2','AF8','AF7','AF4'},
                     'Fudge':{'Iz','FT10', 'TP10', 'FT9', 'TP9','F1'},
                     'g': {'T7','CP1','TP9','P7','PO7','O1'},
-                    'Ron': {'Iz'}                   }
+                    'Ron': {'Iz','Cz'}                   }
     if subject in bad_elecs_dict.keys():
         subject_bad_electrodes=bad_elecs_dict[subject]
     else: 
@@ -196,32 +196,22 @@ def EEG_Preprocessing (current_path,raw_combined, params_dict):
         Raw.drop_channels(list(elecs_to_drop))
     Raw.drop_channels(Raw.info['bads'])
     Raw.set_eeg_reference(ref_channels="average")
-    # # Do csd: 
-    # if (PerformCsd):
-    #     print('\n###########################################################')
-    #     print('running csd')
-    #     Raw_CSD = mne.preprocessing.compute_current_source_density(Raw) ## Compute CSD
-    # else :
-    print('\n###########################################################')
-    print('not using csd')
     mne.set_eeg_reference(Raw, copy=False)
-    Raw_CSD =Raw
     print('\n###########################################################')
     print('filtering the data')  
-   # Raw_CSD.pick= (params_dict['Electorde_Group'])
-    unfiltered_Raw_CSD=Raw_CSD.copy()
-    Raw_CSD_Filtered = unfiltered_Raw_CSD.filter(LowPass, HighPass, method=filter_method, pad='reflect_limited')
+    unfiltered_Raw=Raw.copy()
+    Raw_Filtered = unfiltered_Raw.filter(LowPass, HighPass, method=filter_method, pad='reflect_limited')
 
     if params_dict['pipeline_name']=='fbcsp+lda':
         #extract filterbank feequencies:
         filters_bands=tuple(params_dict['filters_bands'])
         filtered_data_band_passed=[]
         for i,(LowPass,HighPass) in enumerate(filters_bands):
-            unfiltered_Raw_CSD=Raw_CSD.copy()
-            Raw_CSD_Filtered_band= mne.filter.filter_data(unfiltered_Raw_CSD.get_data(),sfreq=500, l_freq=LowPass, h_freq=HighPass, method='fir',copy = True)
-            filtered_data_band_passed.append(Raw_CSD_Filtered_band)
+            unfiltered_Raw=Raw.copy()
+            Raw_Filtered_band= mne.filter.filter_data(unfiltered_Raw.get_data(),sfreq=500, l_freq=LowPass, h_freq=HighPass, method='fir',copy = True)
+            filtered_data_band_passed.append(Raw_Filtered_band)
 
-    events_from_annot,event_dict = mne.events_from_annotations(Raw_CSD_Filtered)
+    events_from_annot,event_dict = mne.events_from_annotations(Raw_Filtered)
     print('\n###########################################################')
     print('extracting event info:',event_dict)
     
@@ -234,7 +224,7 @@ def EEG_Preprocessing (current_path,raw_combined, params_dict):
         #filter bank related: 
         filter_bank_epochs=[]
         for filtered_data_band in filtered_data_band_passed:
-            filtered_data_band_raw = mne.io.RawArray(filtered_data_band,unfiltered_Raw_CSD.info)
+            filtered_data_band_raw = mne.io.RawArray(filtered_data_band,unfiltered_Raw.info)
             epochs = mne.Epochs(filtered_data_band_raw, events_from_annot, preload = True,baseline= None, tmin=tmin, tmax=tmax, event_id=events_trigger_dict,detrend=0)
             # Calculate the mean across epochs for the current event
             mean_across_epochs = epochs.get_data().mean(axis=0)
@@ -246,14 +236,14 @@ def EEG_Preprocessing (current_path,raw_combined, params_dict):
             filter_bank_epochs.append(epochs)
         
     
-    print(f'epoching + selecting current electodes set for analysis:\n{selected_elecs}')
-    epochs = mne.Epochs(Raw_CSD_Filtered, events_from_annot, preload = True,baseline= None, tmin=tmin, tmax=tmax, event_id=events_trigger_dict,detrend=0)
+    epochs = mne.Epochs(Raw_Filtered, events_from_annot, preload = True,baseline= None, tmin=tmin, tmax=tmax, event_id=events_trigger_dict,detrend=0)
     
-
+    # If we want to perform auto rejection of epochs (time expensive)
     #ar = AutoReject()
     #epochs = ar.fit_transform(epochs)  
 
-    epochs = mne.preprocessing.compute_current_source_density(epochs)
+    if PerformCsd:
+        epochs = mne.preprocessing.compute_current_source_density(epochs) # Perform current source density
     epochs.pick(selected_elecs)
     ## Centering the data
 

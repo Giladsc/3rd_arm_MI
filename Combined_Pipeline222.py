@@ -1067,9 +1067,9 @@ def TEST_plot_precision_recall_curves_from_trained_classifier(predict_test,epcoh
 # From here, everything works with the same functions that run on single participants
 
 # Select relevant events for epoching
-desired_events = ['ActiveRest','OpenPalm'] 
+desired_events = ['ActiveRest','ClosePalm'] 
 # Define which subject to currently check: 
-for recording_file,Subject in zip(recording_files[0:4],subject_names[0:4]):
+for recording_file,Subject in zip(recording_files[5:9],subject_names[5:9]):
     print(recording_file,Subject)
 
 #this code is custom to aggregate all 3 of roi recordings into a single processing_dict structure. 
@@ -1081,7 +1081,7 @@ iteration_ind=0 #select some grid search combination - you can manualy change th
 grid_search_dict_copy=grid_search_dict.copy()
 all_grid_combinations = list(itertools.product(*all_options))
 #here i can change manually the current iteration params: 
-grid_search_dict_copy['Electorde_Groups_names_grid']=['F+FC+C+CP+PO']
+grid_search_dict_copy['Electorde_Groups_names_grid']=['F+C+CP+P+PO']
 grid_search_dict_copy['filters_bands']=[[[7, 12], [12, 20], [20, 28], [28, 35]]]#[[[8,12], [12, 16],[16,20],[20,24],[24,28],[28,32]]]
 #this cell allow to test specific iterations
 params_dict=set_up_params_for_current_grid_iteration(all_grid_combinations,iteration_ind,grid_search_dict_copy)
@@ -1105,7 +1105,7 @@ BinaryClassification = False
 ##########################preprocess each of the recording seperately#########################
 preprocessing_dicts=[]
 
-for recording_file,subject in zip(recording_files[0:4],subject_names[0:4]):
+for recording_file,subject in zip(recording_files[5:9],subject_names[5:9]):
     print(recording_file,subject)
     params_dict['recording_file']=recording_file
     train_inds,validation_inds,preprocessing_dict,mean_across_epochs=run_pre_processing_extract_validation_set(recording_path,current_path,params_dict)
