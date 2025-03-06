@@ -164,7 +164,7 @@ def get_subject_bad_electrodes(subject):
         print('note that no bad electrodes were defined for the current subject:',subject)
     return subject_bad_electrodes 
 
-def EEG_Preprocessing (current_path,raw_combined, params_dict):
+def EEG_Preprocessing (current_path,raw, params_dict):
 
     #extract the current run paramaters: 
     PerformCsd=params_dict['PerformCsd']
@@ -173,7 +173,7 @@ def EEG_Preprocessing (current_path,raw_combined, params_dict):
     tmax=params_dict['epoch_tmax']
     filter_bank_epochs = None
     #read the file:
-    Raw=raw_combined
+    Raw=raw
     #remove non existent channels: 
     if 'ACC_X' in Raw.ch_names:
         Raw.drop_channels(['ACC_X','ACC_Y','ACC_Z']) ## Drop non eeg channels
