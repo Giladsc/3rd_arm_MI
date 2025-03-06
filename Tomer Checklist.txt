@@ -1,0 +1,15 @@
+1. Set up an environment with all required packages.
+2. Locally- create a 'Recordings' folder and download to it the 4 recording of subject 'Fudge' (shared via Goggle drive).
+2. Run the pipeline as is for subject 'Fudge', until you recieve the cross-validation performance as a plot.
+3. Plot a raw mne file (it says where in the script).
+4. plot an epoch file.
+5. examine the change in signal between the raw (unprocessed) and epoch (processed).
+6. Change some of the paramaters in the parameter dictionary, re-run the pre-processing and CV evaluation see how things change.
+7. save the raw file, load it in a seperate script. Experiment with mne, maybe do your own pre-processing on it. 
+You should start with the following lines from the preprocessing function so the recording is setup properly in terms of electrode type, but then you can experiment:
+#remove non existent channels: 
+    if 'ACC_X' in Raw.ch_names:
+        Raw.drop_channels(['ACC_X','ACC_Y','ACC_Z']) ## Drop non eeg channels
+    #set the correct (Brainvision Montage) montage:
+    montage = mne.channels.read_custom_montage((f"{current_path}\Montages\CACS-64_REF.bvef"), head_size=0.095, coord_frame=None) 
+    Raw.set_montage(montage, match_case=True, match_alias=False, on_missing='raise', verbose=None)
