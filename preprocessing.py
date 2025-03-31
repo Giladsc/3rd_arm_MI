@@ -144,6 +144,61 @@ def Load_and_concatenate_xdf(xdf_files, scale_to_mv=True):
 
     return raw_combined
 #%%
+def filter_events_by_rating(raw, movement_events, rating_prefix="Rating-", rating_threshold=3):
+    """
+    Keeps only movement events that are followed by a rating >= threshold.
+    - Keeps original event labels (e.g., 'Right', 'Left').
+    - Removes all rating annotations.
+    - Discards movement events with no rating or with a rating < threshold.
+    """
+    annotations = raw.annotations
+    new_annotations = []
+
+    i = 0
+    while i < len(annotations):
+        desc = annotations.description[i]
+        onset = annotations.onset[i]
+        duration = annotations.duration[i]
+
+        if desc in movement_events:
+            # Check if the next annotation is a rating
+            if i + 1 < len(annotations):
+                next_desc = annotations.description[i + 1]
+                if next_desc.startswith(rating_prefix):
+                    rating = int(next_desc.replace(rating_prefix, ""))
+                    if rating >= rating_threshold:
+                        # Keep the original movement event
+                        new_annotations.append((onset, duration, desc))
+                    # Skip the rating annotation either way
+                    i += 2
+                    continue
+                else:
+                    # No rating following → discard this event
+                    i += 1
+                    continue
+            else:
+                # Last annotation is a movement with no rating → discard
+                i += 1
+                continue
+
+        elif not desc.startswith(rating_prefix):
+            # Keep non-movement, non-rating events (like Beep, Rest, etc.)
+            new_annotations.append((onset, duration, desc))
+
+        # Skip rating annotations entirely
+        i += 1
+
+    # Apply new annotations
+    if new_annotations:
+        onsets, durations, descriptions = zip(*new_annotations)
+        raw.set_annotations(mne.Annotations(onsets, durations, descriptions))
+    else:
+        raw.set_annotations(mne.Annotations([], [], []))  # If empty
+
+    return raw
+
+
+#%%
 def get_subject_bad_electrodes(subject):
     elecs_to_drop={}
     #define here the subject specific electdodes to make sure are removed from the data: 
