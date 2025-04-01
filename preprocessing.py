@@ -144,7 +144,7 @@ def Load_and_concatenate_xdf(xdf_files, scale_to_mv=True):
 
     return raw_combined
 #%%
-def filter_events_by_rating(raw, movement_events, rating_prefix="Rating-", rating_threshold=3):
+def filter_events_by_rating(raw, movement_events, rating_prefix="Rating-", rating_threshold=5):
     """
     Keeps only movement events that are followed by a rating >= threshold.
     - Keeps original event labels (e.g., 'Right', 'Left').
