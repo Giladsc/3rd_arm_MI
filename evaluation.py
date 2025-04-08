@@ -127,7 +127,7 @@ def plot_accuracy_over_time(scores_windows, w_times, params_dict=None, axes_hand
     axes_handle.legend()
     axes_handle.grid(True)
     
-def plot_precision_recall_curves_from_trained_classifier(preprocessing_dict,params_dict,precision_recall_curve_timerange,trained_clf,predict_validation=True):
+def plot_precision_recall_curves_from_trained_classifier(train_inds,validation_inds,params_dict,precision_recall_curve_timerange,trained_clf,epochs,filter_bank_epochs,predict_validation=True):
     #to learn on precision recall curves see :https://scikit-learn.org/stable/auto_examples/model_selection/plot_precision_recall.html 
     #the code is adapated for our usage: 
     #prepreocessing_dict - dictionary that contains the {original epoched data, and the training/validation indexes}
@@ -142,30 +142,30 @@ def plot_precision_recall_curves_from_trained_classifier(preprocessing_dict,para
     #decide if we use the training or the validation set to plot: 
     if predict_validation: 
     #get the relevant data for the validation set: 
-        inds=preprocessing_dict['validation_inds']['original_trial_ind'].values
+        inds=validation_inds
     else:
-        inds=preprocessing_dict['train_inds']
+        inds=train_inds
 
 
     #extract the labels: 
-    labels=preprocessing_dict['epochs'].events[inds, -1]
+    labels=epochs.events[inds, -1]
     #extract the decision function: 
 
     #fbcsp
     if params_dict['pipeline_name']=='fbcsp+lda':
         data_set_fb = []
-        for filtered_data_band_epoch in preprocessing_dict['filter_bank_epochs']:
+        for filtered_data_band_epoch in filter_bank_epochs:
             temp_data = filtered_data_band_epoch.copy().crop(tmin=precision_recall_curve_timerange[0],tmax=precision_recall_curve_timerange[1]).get_data()[:]
             data_set_fb.append(temp_data)
         data_set_fb_4d_array= np.transpose(np.array(data_set_fb),(1,2,3,0))
         decision_function=trained_clf.decision_function((data_set_fb_4d_array)[inds,:])
     else:
-            decision_function=trained_clf.decision_function(preprocessing_dict['epochs'].copy().crop(tmin=precision_recall_curve_timerange[0],tmax=precision_recall_curve_timerange[1]).get_data()[inds,:])
+            decision_function=trained_clf.decision_function(epochs.copy().crop(tmin=precision_recall_curve_timerange[0],tmax=precision_recall_curve_timerange[1]).get_data()[inds,:])
     y_score=decision_function
     # Use label_binarize to be multi-label like settings (basicly the current label position is 1 and rest are 0): 
     #so the label list of say, 0 2 4 4 will output = [1,0,0],[0,1,0],[0,0,1],[0,0,1]
-    classes_numeric_list=list(preprocessing_dict['events_triggers_dict'].values())
-    classes_names_list=list(preprocessing_dict['events_triggers_dict'].keys())
+    classes_numeric_list=list(params_dict['events_trigger_dict'].values())
+    classes_names_list=list(params_dict['events_trigger_dict'].keys())
     #take the classes from the preprocessing dict:
     # Combine classes 3 and 5 into a single class, e.g., class 1
     binarized_labels = np.where(np.isin(labels, [3, 5]), 1, 0)
@@ -243,6 +243,66 @@ def plot_precision_recall_curves_from_trained_classifier(preprocessing_dict,para
 
     return return_df
 
+from sklearn.metrics import precision_recall_curve, average_precision_score, PrecisionRecallDisplay
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+def plot_binary_precision_recall_curve(train_inds, validation_inds, params_dict, precision_recall_curve_timerange, trained_clf, epochs, filter_bank_epochs, predict_validation=True):
+    # Print chosen time window
+    print(f'Chosen window prediction range: {precision_recall_curve_timerange}\n'
+          f'Prediction parameters: {params_dict["windowed_prediction_params"]}')
+
+    inds = validation_inds if predict_validation else train_inds
+
+    labels = epochs.events[inds, -1]
+
+    # Binary mapping (3,5)->Motor Imagery(1), rest->Idle(0)
+    binary_labels = np.where(np.isin(labels, [3, 5]), 1, 0)
+
+    # Extract decision function based on the pipeline
+    if params_dict['pipeline_name'] == 'fbcsp+lda':
+        data_set_fb = []
+        for fb_epoch in filter_bank_epochs:
+            cropped_data = fb_epoch.copy().crop(tmin=precision_recall_curve_timerange[0],
+                                                tmax=precision_recall_curve_timerange[1]).get_data()[inds, :, :]
+            data_set_fb.append(cropped_data)
+        data_array = np.transpose(np.array(data_set_fb), (1, 2, 3, 0))
+        y_score = trained_clf.decision_function(data_array)
+    else:
+        cropped_epochs = epochs.copy().crop(
+            tmin=precision_recall_curve_timerange[0],
+            tmax=precision_recall_curve_timerange[1]
+        ).get_data()[inds, :, :]  # <-- select inds here
+        y_score = trained_clf.decision_function(cropped_epochs)
+
+
+    # Ensure y_score is 1-dimensional (binary)
+    if y_score.ndim > 1:
+        y_score = y_score.ravel()
+
+    # Compute Precision-Recall
+    precision, recall, thresholds = precision_recall_curve(binary_labels, y_score)
+    average_precision = average_precision_score(binary_labels, y_score)
+
+    # Plot
+    plt.figure(figsize=(7, 7))
+    display = PrecisionRecallDisplay(recall=recall, precision=precision, average_precision=average_precision)
+    display.plot()
+    plt.title(f"Binary Precision-Recall Curve\nPredicted Time Range: {precision_recall_curve_timerange}")
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.grid()
+    plt.show()
+
+    # Create DataFrame with results
+    results_df = pd.DataFrame({
+        'precision': precision[:-1],
+        'recall': recall[:-1],
+        'thresholds': thresholds
+    })
+
+    return results_df
 
 def plot_confusion_matrix(conf_mat, class_labels, title="Confusion Matrix"):
     plt.figure(figsize=(6,5))

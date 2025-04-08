@@ -144,7 +144,7 @@ def Load_and_concatenate_xdf(xdf_files, scale_to_mv=True):
 
     return raw_combined
 #%%
-def filter_events_by_rating(raw, movement_events, rating_prefix="Rating-", rating_threshold=5):
+def filter_events_by_rating(raw, movement_events, rating_prefix="Rating-", rating_threshold=3):
     """
     Keeps only movement events that are followed by a rating >= threshold.
     - Keeps original event labels (e.g., 'Right', 'Left').
@@ -166,9 +166,11 @@ def filter_events_by_rating(raw, movement_events, rating_prefix="Rating-", ratin
                 next_desc = annotations.description[i + 1]
                 if next_desc.startswith(rating_prefix):
                     rating = int(next_desc.replace(rating_prefix, ""))
+                    rating_onset = annotations.onset[i]  # <-- ⭐️ NEW LINE
                     if rating >= rating_threshold:
                         # Keep the original movement event
                         new_annotations.append((onset, duration, desc))
+                    new_annotations.append((rating_onset + 5, 0.0, 'Rating'))  # <-- ⭐️ ADD 'Rating' MARKER
                     # Skip the rating annotation either way
                     i += 2
                     continue
@@ -196,7 +198,6 @@ def filter_events_by_rating(raw, movement_events, rating_prefix="Rating-", ratin
         raw.set_annotations(mne.Annotations([], [], []))  # If empty
 
     return raw
-
 
 #%%
 def get_subject_bad_electrodes(subject):
