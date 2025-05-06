@@ -36,8 +36,9 @@ from sklearn.model_selection import ShuffleSplit, cross_val_score,train_test_spl
 from sklearn.metrics import confusion_matrix,ConfusionMatrixDisplay
 from sklearn.model_selection import cross_val_score, StratifiedShuffleSplit, train_test_split
 from pyriemann.estimation import ERPCovariances, XdawnCovariances, Xdawn, Covariances
-from pyriemann.tangentspace import TangentSpace
-from pyriemann.classification import MDM
+from pyriemann.tangentspace import TangentSpace,FGDA
+from pyriemann.classification import MDM,FgMDM
+
 
 #import moab to get the filterbank implementation: 
 from moabb.pipelines.utils import FilterBank
@@ -182,11 +183,32 @@ def classifier_training(fold_train_data_x,fold_train_data_y,params_dict, BinaryC
         clf = Pipeline([('csp',csp), ('ovo_svm', OneVsOneClassifier(SVC(kernel='linear', random_state=42)))])
     elif curr_classifier_name=='ts+lda':
         #define the classifier components:  
-        cov = Covariances(estimator="lwf")
+        cov = Covariances(estimator="oas")
         ts = TangentSpace()
+        scaler = StandardScaler() 
         lda = LinearDiscriminantAnalysis()
         #define the pipeline: 
-        clf = Pipeline([('cov',cov),('ts', ts), ('LDA', lda)])
+        clf = Pipeline([('cov',cov),('ts', ts),('scaler', scaler), ('LDA', lda)])
+    elif curr_classifier_name == 'ts+FGDA':
+        clf = Pipeline([
+            ('cov', Covariances(estimator="oas")),
+            ('fgda', FGDA(metric='riemann', tsupdate=False)),
+            ('ts', TangentSpace()),
+            ('scaler', StandardScaler()),
+            ('lda', LinearDiscriminantAnalysis())
+        ])
+
+    elif curr_classifier_name == 'MDM':
+        clf = Pipeline([
+            ('cov', Covariances(estimator="oas")),
+            ('mdm', MDM(metric=dict(mean="riemann", distance="riemann")))
+        ])
+
+    elif curr_classifier_name == 'FgMDM':
+        clf = Pipeline([
+            ('cov', Covariances(estimator="oas")),
+            ('fgmdm', FgMDM(metric='riemann', tsupdate=False, n_jobs=1))
+        ])
     elif curr_classifier_name=='fbcsp+lda':
         #define the classifier components: 
         lda = LinearDiscriminantAnalysis()
