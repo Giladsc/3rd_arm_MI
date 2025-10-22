@@ -67,7 +67,6 @@ import copy
 
 
 from braindecode.models import ShallowFBCSPNet
-from braindecode.datautil import create_from_mne_epochs
 from braindecode.training import CroppedLoss
 from braindecode.training.scoring import trial_preds_from_window_preds
 from torch.optim import Adam
@@ -252,7 +251,6 @@ def EEG_Preprocessing (current_path,raw, params_dict):
         Raw.drop_channels(list(elecs_to_drop))
     Raw.drop_channels(Raw.info['bads'])
     Raw.set_eeg_reference(ref_channels="average")
-    mne.set_eeg_reference(Raw, copy=False)
     print('\n###########################################################')
     print('filtering the data')  
     unfiltered_Raw=Raw.copy()

@@ -68,7 +68,6 @@ import copy
 
 
 from braindecode.models import ShallowFBCSPNet
-from braindecode.datautil import create_from_mne_epochs
 from braindecode.training import CroppedLoss
 from braindecode.training.scoring import trial_preds_from_window_preds
 from torch.optim import Adam

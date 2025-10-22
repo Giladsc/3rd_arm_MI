@@ -69,7 +69,6 @@ import copy
 
 
 from braindecode.models import ShallowFBCSPNet
-from braindecode.datautil import create_from_mne_epochs
 from braindecode.training import CroppedLoss
 from braindecode.training.scoring import trial_preds_from_window_preds
 from torch.optim import Adam
@@ -80,7 +79,7 @@ import torch
 
 
 from training import *
-#%%
+# %%
 def plot_accuracy_over_time(scores_windows, w_times, params_dict=None, axes_handle=None):
     import numpy as np
     import pandas as pd
@@ -92,6 +91,7 @@ def plot_accuracy_over_time(scores_windows, w_times, params_dict=None, axes_hand
         params_dict = {}
     if axes_handle is None:
         _, axes_handle = plt.subplots()
+
     # Extract the number of classes from params_dict or default to 3
     num_classes = len(params_dict['desired_events'])
     chance_level = 1 / num_classes  # Calculate chance level dynamically
@@ -112,21 +112,81 @@ def plot_accuracy_over_time(scores_windows, w_times, params_dict=None, axes_hand
     # Plot using seaborn
     sns.lineplot(data=longform_scores_windows_df, x='Time', y='Accuracy', ax=axes_handle)
 
-    # Add onset and chance lines
+    # Add onset line if applicable
     if any(w_times > 0):
         onset_location = np.round(w_times[w_times >= 0][0], 2)
-        axes_handle.axvline(onset_location, linestyle='--', color='k', label='Onset') 
-    axes_handle.axhline(chance_level, linestyle='-', color='k', label='Chance') 
+        axes_handle.axvline(onset_location, linestyle='--', color='k', label='Onset')
+
+    # Add chance level line as dotted
+    axes_handle.axhline(chance_level, linestyle='-.', color='k', label=f'Chance')
+
+    # Add shaded area for Cue
+    axes_handle.axvspan(-1.25, -0, color='blue', alpha=0.3, label='Cue (Jittered)')
 
     # Customize the plot
     axes_handle.set_xlabel('Time (s)')
     axes_handle.set_ylabel('Classification Accuracy')
     axes_handle.set_title('Classification Score Over Time')
     axes_handle.set_ylim([0.2, 1])
-    axes_handle.set_xlim([-2, 5])  # Adjust the x-axis limits to extend to 5 seconds
+    axes_handle.set_xlim([-6, 5])  # Adjust the x-axis limits to extend to 5 seconds
     axes_handle.legend()
     axes_handle.grid(True)
-    
+
+def plot_accuracy_over_time_multiple_subjects(subjects_scores_windows, w_times, params_dict=None, axes_handle=None):    
+    from scipy.stats import sem
+
+    # Initialize defaults
+    if params_dict is None:
+        params_dict = {}
+    if axes_handle is None:
+        _, axes_handle = plt.subplots()
+
+    # Wrap single subject data
+    if not isinstance(subjects_scores_windows, list):
+        subjects_scores_windows = [subjects_scores_windows]
+
+    # Number of classes and chance level
+    num_classes = len(params_dict.get('desired_events'))
+    chance_level = 1 / num_classes
+
+    # Convert all subjects' data to 2D: (total_folds_across_subjects, n_times)
+    all_folds = []
+    for subj_data in subjects_scores_windows:
+        subj_data = np.squeeze(np.array(subj_data))  # shape (n_folds, n_times)
+        if subj_data.shape[1] != len(w_times):
+            raise ValueError("Mismatch between scores_windows and w_times.")
+        all_folds.append(subj_data)
+    all_folds_array = np.concatenate(all_folds, axis=0)  # shape (total_folds, n_times)
+
+    # Calculate mean and SEM across all folds (and subjects)
+    mean_acc = np.mean(all_folds_array, axis=0)
+    sem_acc = sem(all_folds_array, axis=0)
+
+    # Plot with shaded SEM
+    times = np.round(w_times, 2)
+    axes_handle.plot(times, mean_acc, label='Mean Accuracy', color='#708090')
+    axes_handle.fill_between(times, mean_acc - sem_acc, mean_acc + sem_acc,
+                         alpha=0.3, color='#008080', label='±1 SEM')
+
+    # Vertical line for MI onset (if relevant)
+    if any(np.array(w_times) > 0):
+        onset_time = np.round(np.array(w_times)[np.array(w_times) >= 0][0], 2)
+        axes_handle.axvline(onset_time, linestyle='--', color='k', label='Onset')
+
+    # Chance level line
+    axes_handle.axhline(chance_level, linestyle='-.', color='gray', label=f'Chance ({chance_level:.2f})')
+
+    # Cue shading
+    axes_handle.axvspan(-1.25, 0, color='blue', alpha=0.2, label='Cue (Jittered)')
+
+    # Styling
+    axes_handle.set_xlabel('Time (s)')
+    axes_handle.set_ylabel('Classification Accuracy')
+    axes_handle.set_title('Mean Accuracy Over Time (±SEM)')
+    axes_handle.set_ylim([0.2, 1])
+    axes_handle.set_xlim([-2, 5])
+    axes_handle.legend(loc='lower right')  # moved legend out of the plot area
+    axes_handle.grid(True)
 def plot_precision_recall_curves_from_trained_classifier(train_inds,validation_inds,params_dict,precision_recall_curve_timerange,trained_clf,epochs,filter_bank_epochs,predict_validation=True):
     #to learn on precision recall curves see :https://scikit-learn.org/stable/auto_examples/model_selection/plot_precision_recall.html 
     #the code is adapated for our usage: 
