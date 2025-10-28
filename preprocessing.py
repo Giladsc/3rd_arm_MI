@@ -249,12 +249,19 @@ def EEG_Preprocessing (current_path,raw, params_dict):
 
     if len(elecs_to_drop)>0: 
         Raw.drop_channels(list(elecs_to_drop))
+    
     Raw.drop_channels(Raw.info['bads'])
-    Raw.set_eeg_reference(ref_channels="average")
+    if (params_dict['PerformAvgRef']):
+        Raw.set_eeg_reference(ref_channels="average")
     print('\n###########################################################')
     print('filtering the data')  
     unfiltered_Raw=Raw.copy()
-    Raw_Filtered = unfiltered_Raw.filter(LowPass, HighPass, method=filter_method, pad='reflect_limited')
+    
+    notched_Raw = unfiltered_Raw.filter(1, 100, method=filter_method, phase='forward', pad=0)  
+    notched_Raw.notch_filter(50, method=filter_method, phase='forward') 
+    if PerformCsd:
+        notched_Raw = mne.preprocessing.compute_current_source_density(notched_Raw) # Perform current source density
+    Raw_Filtered = notched_Raw.filter(LowPass, HighPass, method=filter_method, iir_params = dict(order=4, ftype='butter'),phase='forward',pad=0)
 
     if params_dict['pipeline_name']=='fbcsp+lda':
         #extract filterbank feequencies:
@@ -296,8 +303,7 @@ def EEG_Preprocessing (current_path,raw, params_dict):
     #ar = AutoReject()
     #epochs = ar.fit_transform(epochs)  
 
-    if PerformCsd:
-        epochs = mne.preprocessing.compute_current_source_density(epochs) # Perform current source density
+    
     epochs.pick(selected_elecs)
     ## Centering the data
 

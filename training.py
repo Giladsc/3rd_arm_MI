@@ -236,62 +236,133 @@ def classifier_training(fold_train_data_x,fold_train_data_y,params_dict, BinaryC
         clf.fit(fold_train_data_x, fold_train_data_y_labels)
     # running classifier: test classifier on sliding window
     return clf,csp,lda
-def run_windowed_pretrained_classifier(clf, x_uncropped, y, w_start, w_length):
+
+def assert_same_label_space(y, classes):
+    diff = np.setdiff1d(np.unique(y), classes)
+    assert diff.size == 0, f"Test labels {diff.tolist()} not in trained classes {classes.tolist()}"
+def run_windowed_pretrained_classifier(clf, x_uncropped, y, w_start, w_length, verbose=False):
     scores_per_time_window = []
     confusion_matrices_per_window = []
-    
-    if len(x_uncropped.shape) == 3:  # Ensure 4D shape for filterbank case
-        x_uncropped = x_uncropped.reshape(list(x_uncropped.shape) + [1])
-    
-    class_labels = clf.classes_  # Get class labels
-    print("Class order in confusion matrix:", class_labels)  # Debugging
+    classes = np.array(clf.classes_)
+    if verbose:
+        print("Class order in confusion matrix:", classes)
+
+    # Sanity: label space match
+    assert_same_label_space(y, classes)
 
     for n in w_start:
-        fold_data = np.squeeze(x_uncropped[:, :, n:(n + w_length), :])
-        fold_score_on_time_window = clf.score(fold_data, y)
-        scores_per_time_window.append(fold_score_on_time_window)
-
-        # Compute confusion matrix
-        confusion_mat = confusion_matrix(y, clf.predict(fold_data), labels=class_labels)
-        confusion_matrices_per_window.append((confusion_mat, class_labels))
+        fold_data = _slice_window_block(x_uncropped, n, w_length)  # keeps rank consistent
+        y_pred = clf.predict(fold_data)
+        scores_per_time_window.append(np.mean(y_pred == y))
+        cm = confusion_matrix(y, y_pred, labels=classes)
+        confusion_matrices_per_window.append((cm, classes))
 
     return scores_per_time_window, confusion_matrices_per_window
+def _slice_window_block(x4, start, length):
+    # x4 expected: (epochs, ch, T, filters)  or (epochs, ch, T) -> promote to 4D
+    if x4.ndim == 3:
+        x4 = x4[..., None]  # add filterbank dim
+    window = x4[:, :, start:start+length, :]          # (E, C, L, F)
+    if window.shape[-1] == 1:
+        window = window[..., 0]                       # back to (E, C, L) if no FB
+    return window
 
+def run_windowed_classification_aug_cv(epochs, epochs_cropped, cv_split, params_dict, BinaryClassification=False):
+    """
+    Train-and-evaluate windowed classifiers with in-fold augmentation, avoiding leakage.
 
-def run_windowed_classification_aug_cv(epochs, epochs_cropped,cv_split,params_dict, BinaryClassification =False):
+    epochs:            MNE Epochs (UNCROPPED) used for windowed testing (x_test_uncropped)
+    epochs_cropped:    MNE Epochs (CROPPED)  used for training/augmentation source
+    cv_split:          iterable of (train_idx, test_idx)
+    params_dict:       dict with keys:
+                       - 'augmentation_params': {'win_len': seconds, 'win_step': seconds}
+                       - 'windowed_prediction_params': {'win_len': seconds, 'win_step': seconds}
+                       - 'epoch_tmin': float
+                       - 'pipeline_name', etc. (used by classifier_training)
+                       - optionally 'binary_positive_classes' for BinaryClassification
+    BinaryClassification: bool
+    """
     from preprocessing import augment_data
-    augmentation_params=params_dict['augmentation_params']
-    windowed_prediction_params=params_dict['windowed_prediction_params']
-    win_len=windowed_prediction_params['win_len']
-    win_step=windowed_prediction_params['win_step']
-    sfreq = epochs_cropped.info['sfreq']
-    epochs_cropped_data = epochs_cropped.get_data()
-    epochs_data = epochs.get_data()
-    w_length = int(sfreq * win_len)   # running classifier: window length
-    w_step = int(sfreq * win_step)  # running classifier: window step size
-    w_start = np.arange(0, epochs_data.shape[2] - w_length, w_step)
+
+    augmentation_params = params_dict['augmentation_params']
+    windowed_prediction_params = params_dict['windowed_prediction_params']
+    win_len = float(windowed_prediction_params['win_len'])
+    win_step = float(windowed_prediction_params['win_step'])
+
+    # Pull data once
+    epochs_cropped_data = epochs_cropped.get_data()  # training/augmentation view
+    epochs_data = epochs.get_data()                  # windowed test view
+
+    # ---------- Alignment & consistency checks ----------
+    assert epochs.events.shape[0] == epochs_cropped.events.shape[0], "Epoch count mismatch"
+    # Ensure identical trial order & labels (last col usually encodes event id)
+    assert np.all(epochs.events[:, -1] == epochs_cropped.events[:, -1]), "Mismatch epochs vs epochs_cropped"
+
+    # Use sfreq from the object you actually window (epochs)
+    sfreq = epochs.info['sfreq']
+
+    # Window params in samples
+    w_length = int(round(sfreq * win_len))
+    w_step_samp = int(round(sfreq * win_step))
+
+    # Defensive: window step must be >= 1 and length must be <= trial length
+    assert w_length > 0, f"win_len too small; got {win_len}s -> {w_length} samples"
+    assert w_step_samp >= 1, f"win_step too small; got {win_step}s -> {w_step_samp} samples"
+    assert epochs_data.shape[2] >= w_length, "Trials shorter than window length"
+
+    # Start indices INCLUDING the last window that fits exactly
+    # shape[2] = n_times; valid starts are [0 .. n_times - w_length]
+    w_start = np.arange(0, epochs_data.shape[2] - w_length + 1, w_step_samp)
 
     scores_windows = []
-    folds_confusion_matrices_per_window=[]
-    # This section first extracts each CV fold, only then it augments it (to avoid data leakage)
+    folds_confusion_matrices_per_window = []
+
+    # ---------- Cross-validation ----------
     for train_idx, test_idx in cv_split:
-        #separate the cv fold for labels - train-test:
-        y_train, y_test = epochs_cropped.events[train_idx,-1], epochs_cropped.events[test_idx,-1]
-        #separate the cv fold for features information: 
-        if len(epochs_cropped_data.shape)==3:
-            data_fold_x_train_to_augment = epochs_cropped_data[train_idx,:,:]
-        elif len(epochs_cropped_data.shape)==4: #there are filter bank info in the data: 
-            data_fold_x_train_to_augment = epochs_cropped_data[train_idx,:,:,:] 
-        #do augmentation: 
-        augmented_x,augmented_y=augment_data(augmentation_params,data_fold_x_train_to_augment,y_train,sfreq)
-        # Train a new classifier for each fold
-        clf,_,_ = classifier_training(augmented_x,augmented_y,params_dict, BinaryClassification = False)
-        #run classifier on the data fold
-        curr_scores_windows,confusion_matrices_per_window=run_windowed_classification_on_fold(augmented_x,augmented_y,epochs_data[test_idx],y_test,params_dict,w_start,w_length,clf,BinaryClassification)         
+        # Labels (ints) per fold
+        y_train = epochs_cropped.events[train_idx, -1]
+        y_test  = epochs_cropped.events[test_idx,  -1]
+
+        # Training features slice (support 3D or 4D with filterbanks)
+        if epochs_cropped_data.ndim == 3:
+            x_train_source = epochs_cropped_data[train_idx, :, :]
+        elif epochs_cropped_data.ndim == 4:
+            x_train_source = epochs_cropped_data[train_idx, :, :, :]
+        else:
+            raise ValueError(f"Unexpected epochs_cropped_data ndim={epochs_cropped_data.ndim}")
+
+        # --- Augment TRAIN ONLY (no leakage) ---
+        augmented_x, augmented_y = augment_data(augmentation_params, x_train_source, y_train, sfreq)
+
+        # --- Fit classifier INSIDE the fold ---
+        clf, _, _ = classifier_training(
+            augmented_x,
+            augmented_y,
+            params_dict,
+            BinaryClassification=BinaryClassification  # propagate flag correctly
+        )
+
+        # --- Windowed evaluation on the UNCROPPED TEST trials ---
+        x_test_uncropped = epochs_data[test_idx, ...]
+        curr_scores_windows, confusion_matrices_per_window = run_windowed_classification_on_fold(
+            augmented_x,                 # (not used for predicting; kept for signature parity)
+            augmented_y,                 # (same)
+            x_test_uncropped,
+            y_test,
+            params_dict,
+            w_start,
+            w_length,
+            clf,
+            BinaryClassification=BinaryClassification
+        )
+
         scores_windows.append(curr_scores_windows)
         folds_confusion_matrices_per_window.append(confusion_matrices_per_window)
-    w_times = (w_start + w_length / 2.) / sfreq + params_dict['epoch_tmin']
-    return scores_windows,folds_confusion_matrices_per_window,w_times
+
+    # Window center times (s) relative to epoch_tmin
+    w_times = (w_start + w_length / 2.0) / sfreq + params_dict['epoch_tmin']
+
+    return scores_windows, folds_confusion_matrices_per_window, w_times
 
 def run_windowed_classification_aug(epochs_cropped,train_set_data,train_set_labels,train_set_data_uncroped,test_y,params_dict,BinaryClassification):
     augmentation_params=params_dict['augmentation_params']
