@@ -256,13 +256,18 @@ def EEG_Preprocessing (current_path,raw, params_dict):
     print('\n###########################################################')
     print('filtering the data')  
     unfiltered_Raw=Raw.copy()
-    
-    notched_Raw = unfiltered_Raw.filter(1, 100, method=filter_method, phase='forward', pad=0)  
-    notched_Raw.notch_filter(50, method=filter_method, phase='forward') 
-    if PerformCsd:
-        notched_Raw = mne.preprocessing.compute_current_source_density(notched_Raw) # Perform current source density
-    Raw_Filtered = notched_Raw.filter(LowPass, HighPass, method=filter_method, iir_params = dict(order=4, ftype='butter'),phase='forward',pad=0)
-
+    if (filter_method == 'iir'):
+        notched_Raw = unfiltered_Raw.filter(1, 100, method=filter_method, phase='forward', pad=0)  
+        notched_Raw.notch_filter(50, method=filter_method, phase='forward') 
+        if PerformCsd:
+            notched_Raw = mne.preprocessing.compute_current_source_density(notched_Raw) # Perform current source density
+        Raw_Filtered = notched_Raw.filter(LowPass, HighPass, method=filter_method, iir_params = dict(order=4, ftype='butter'),phase='forward',pad=0)
+    if (filter_method == 'fir'):
+        notched_Raw = unfiltered_Raw.filter(1, 100, method=filter_method)  
+        notched_Raw.notch_filter(50, method=filter_method) 
+        if PerformCsd:
+            notched_Raw = mne.preprocessing.compute_current_source_density(notched_Raw) # Perform current source density
+        Raw_Filtered = notched_Raw.filter(LowPass, HighPass, method=filter_method)
     if params_dict['pipeline_name']=='fbcsp+lda':
         #extract filterbank feequencies:
         filters_bands=tuple(params_dict['filters_bands'])
