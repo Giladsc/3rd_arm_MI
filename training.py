@@ -221,8 +221,8 @@ def classifier_training(fold_train_data_x,fold_train_data_y,params_dict, BinaryC
     #get string labels instead of numeric (so the classifier will have an informative clf.classes_ )
     triggers_label_dict={val:key for key,val in params_dict['events_trigger_dict'].items()} 
     fold_train_data_y_labels=np.array([triggers_label_dict[cur_y] for cur_y in fold_train_data_y])  
-    A, B  = 'OpenPalm', 'ClosedPalm'  # Replace with actual trigger names/values
-    combined_labels_train = np.array(['motor_imagery' if label in [A, B] else label for label in fold_train_data_y_labels])
+    A, B , C = 'RightHand','LeftHand', 'ClosePalm'  # Replace with actual trigger names/values
+    combined_labels_train = np.array(['motor_imagery' if label in [A, B,C] else label for label in fold_train_data_y_labels])
     
     
     # Define class weights based on class distribution
@@ -386,7 +386,8 @@ def run_windowed_classification_on_fold(fold_train_data_x,fold_train_data_y,fold
     triggers_label_dict={val:key for key,val in params_dict['events_trigger_dict'].items()} 
     fold_test_data_y_labels=np.array([triggers_label_dict[cur_y] for cur_y in fold_test_data_y])
     if BinaryClassification:
-        combined_labels_test = np.array(['motor_imagery' if label in [A, B] else label for label in fold_test_data_y_labels])
+        A, B , C = 'RightHand','LeftHand', 'ClosePalm'  # Replace with actual trigger names/values
+        combined_labels_test = np.array(['motor_imagery' if label in [A, B, C] else label for label in fold_test_data_y_labels])
         fold_windowed_scores,confusion_matrices_per_window=run_windowed_pretrained_classifier(clf,fold_test_data_x_uncropped,combined_labels_test,w_start,w_length)
     else:
         fold_windowed_scores,confusion_matrices_per_window=run_windowed_pretrained_classifier(clf,fold_test_data_x_uncropped,fold_test_data_y_labels,w_start,w_length)

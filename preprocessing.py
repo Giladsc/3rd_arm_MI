@@ -11,7 +11,7 @@ from matplotlib import pyplot as plt
 import itertools
 from tqdm import tqdm
 import json
-
+import random
 # MNE library for EEG data analysis
 import mne
 from mne import Epochs,find_events
@@ -211,15 +211,15 @@ def get_subject_bad_electrodes(subject):
                     'Roei-MI': {'FT10', 'TP10','P2','AF8','AF7','AF4'},
                     'Fudge':{'Iz','FT10', 'TP10', 'FT9', 'TP9','F1'},
                     'g': {'T7','CP1','TP9','P7','PO7','O1'},
-                    'Ron': {'Iz','Cz'}                   }
+                    'Ron': {'Iz','Cz'},                   
+                    'GiladRSL' : {'C5','FC4','CP5','T7',}}
     if subject in bad_elecs_dict.keys():
         subject_bad_electrodes=bad_elecs_dict[subject]
     else: 
         subject_bad_electrodes={}
         print('note that no bad electrodes were defined for the current subject:',subject)
     return subject_bad_electrodes 
-
-def EEG_Preprocessing (current_path,raw, params_dict):
+def raw_EEG_Preprocessing (current_path,raw, params_dict):
 
     #extract the current run paramaters: 
     PerformCsd=params_dict['PerformCsd']
@@ -257,6 +257,30 @@ def EEG_Preprocessing (current_path,raw, params_dict):
     print('filtering the data')  
     unfiltered_Raw=Raw.copy()
     if (filter_method == 'iir'):
+        notched_Raw = unfiltered_Raw.filter(1,100, method=filter_method, phase='forward', pad=0)  
+        notched_Raw.notch_filter(50, method=filter_method, phase='forward') 
+        if PerformCsd:
+            notched_Raw = mne.preprocessing.compute_current_source_density(notched_Raw) # Perform current source density
+        Raw_Filtered = notched_Raw.filter(LowPass, 100, method=filter_method, iir_params = dict(order=4, ftype='butter'),phase='forward',pad=0)
+    if (filter_method == 'fir'):
+        notched_Raw = unfiltered_Raw.filter(1,None, method=filter_method)  
+        notched_Raw.notch_filter(50, method=filter_method) 
+        if PerformCsd:
+            notched_Raw = mne.preprocessing.compute_current_source_density(notched_Raw) # Perform current source density
+        Raw_Filtered = notched_Raw
+    return Raw_Filtered
+
+def Post_ICA_EEG_Preprocessing (current_path,raw, params_dict):
+    #extract the current run paramaters: 
+    PerformCsd=params_dict['PerformCsd']
+    LowPass, HighPass, filter_method = params_dict['LowPass'],params_dict['HighPass'],params_dict['filter_method']
+    tmin=params_dict['epoch_tmin']
+    tmax=params_dict['epoch_tmax']
+    Raw = raw
+    print('\n###########################################################')
+    print('filtering the data')  
+    unfiltered_Raw=Raw.copy()
+    if (filter_method == 'iir'):
         notched_Raw = unfiltered_Raw.filter(1, 100, method=filter_method, phase='forward', pad=0)  
         notched_Raw.notch_filter(50, method=filter_method, phase='forward') 
         if PerformCsd:
@@ -276,15 +300,51 @@ def EEG_Preprocessing (current_path,raw, params_dict):
             unfiltered_Raw=Raw.copy()
             Raw_Filtered_band= mne.filter.filter_data(unfiltered_Raw.get_data(),sfreq=500, l_freq=LowPass, h_freq=HighPass, method='fir',copy = True)
             filtered_data_band_passed.append(Raw_Filtered_band)
-
+    
     events_from_annot,event_dict = mne.events_from_annotations(Raw_Filtered)
+    events_trigger_dict = {key: event_dict[key] for key in event_dict.keys() if key in params_dict['desired_events']}
+
+    # if events_from_annot is None or len(events_from_annot) == 0:
+    #     print("No events found in this recording. Returning filtered_raw only.")
+    #     filter_bank_epochs = []
+    #     mean_across_epochs = None
+    #     epochs = None
+    #     return Raw_Filtered, epochs, filter_bank_epochs, mean_across_epochs, events_trigger_dict
+
     print('\n###########################################################')
     print('extracting event info:',event_dict)
     
-    events_trigger_dict = {key: event_dict[key] for key in event_dict.keys() if key in params_dict['desired_events']}
-    print('\n###########################################################')
+
     filtered_electrodes  = [elec for elec in params_dict['Electorde_Group'] if elec not in elecs_to_drop]
     selected_elecs=filtered_electrodes
+    
+    # Handle the case where there are NO events (e.g., pure idle file)
+    if events_trigger_dict is None or len(events_trigger_dict) == 0:
+        print("No events found in this recording. Returning filtered_raw only.")
+        filter_bank_epochs = []
+        mean_across_epochs = None
+        events_idle = mne.make_fixed_length_events(
+            Raw_Filtered,
+            id=0,
+            start=8.0,     # first event at 4 s -> epoch spans 0..10 s
+            duration=10.0  # events spaced every 10 s
+        )
+
+        # 2) Epoch around these events with the same window as your MI epochs
+        idle_event_id = {'Idle': 0}
+
+        idle_epochs = mne.Epochs(
+            Raw_Filtered,
+            events_idle,
+            event_id=idle_event_id,
+            tmin=-8.0,
+            tmax=6.0,
+            baseline=None,   # same baseline as MI
+            detrend=0,
+            preload=True
+        )
+        idle_epochs.pick(selected_elecs)
+        return Raw_Filtered, idle_epochs, filter_bank_epochs, mean_across_epochs, events_trigger_dict
 
     if params_dict['pipeline_name']=='fbcsp+lda':
         #filter bank related: 
@@ -302,7 +362,7 @@ def EEG_Preprocessing (current_path,raw, params_dict):
             filter_bank_epochs.append(epochs)
         
     
-    epochs = mne.Epochs(Raw_Filtered, events_from_annot, preload = True,baseline= None, tmin=tmin, tmax=tmax, event_id=events_trigger_dict,detrend=0)
+    epochs = mne.Epochs(Raw_Filtered, events_from_annot, preload = True,baseline= [-2.5,-0.5], tmin=tmin, tmax=tmax, event_id=events_trigger_dict,detrend=0)
     
     # If we want to perform auto rejection of epochs (time expensive)
     #ar = AutoReject()
@@ -377,13 +437,210 @@ def EEG_Preprocessing (current_path,raw, params_dict):
         print(f'the current selected electrodes: {curr_elecs_in_epochs_set} allready exclude the requested electrodes to remove {elecs_to_remove}')
         print('#############################################################')
 
-    return epochs,filter_bank_epochs,mean_across_epochs, events_trigger_dict
+    return Raw_Filtered,epochs,filter_bank_epochs,mean_across_epochs, events_trigger_dict
+
+
+def EEG_Preprocessing (current_path,raw, params_dict):
+
+    #extract the current run paramaters: 
+    PerformCsd=params_dict['PerformCsd']
+    LowPass, HighPass, filter_method = params_dict['LowPass'],params_dict['HighPass'],params_dict['filter_method']
+    tmin=params_dict['epoch_tmin']
+    tmax=params_dict['epoch_tmax']
+    filter_bank_epochs = None
+    #read the file:
+    Raw=raw
+    #remove non existent channels: 
+    if 'ACC_X' in Raw.ch_names:
+        Raw.drop_channels(['ACC_X','ACC_Y','ACC_Z']) ## Drop non eeg channels
+    #set the correct (Brainvision Montage) montage:
+    montage = mne.channels.read_custom_montage((f"{current_path}\Montages\CACS-64_REF.bvef"), head_size=0.095, coord_frame=None) 
+    #rename channels for consistency (no longer required for future recordings): 
+    #mne.rename_channels(Raw.info, {'F9' : 'FT9','P9' : 'TP9','P10' : 'TP10','F10' : 'FT10','AF1' : 'AF7' }, allow_duplicates=False, verbose=None)
+    Raw.set_montage(montage, match_case=True, match_alias=False, on_missing='raise', verbose=None)
+
+    print('\n###########################################################')
+    print('removing subject specific bad electrodes from the raw data')
+    #drop bad electrodes according to the current subject name: 
+    print('\n###########################################################')
+    print('removing bad channels from epochs:')
+    curr_elecs_in_epochs_set=set(Raw.info['ch_names'])
+    elecs_to_remove=params_dict['bad_electrodes']
+    elecs_to_drop=curr_elecs_in_epochs_set.intersection(elecs_to_remove)
+
+    if len(elecs_to_drop)>0: 
+        Raw.drop_channels(list(elecs_to_drop))
+    
+    Raw.drop_channels(Raw.info['bads'])
+    if (params_dict['PerformAvgRef']):
+        Raw.set_eeg_reference(ref_channels="average")
+    print('\n###########################################################')
+    print('filtering the data')  
+    unfiltered_Raw=Raw.copy()
+    if (filter_method == 'iir'):
+        notched_Raw = unfiltered_Raw.filter(1, 100, method=filter_method, phase='forward', pad=0)  
+        notched_Raw.notch_filter(50, method=filter_method, phase='forward') 
+        if PerformCsd:
+            notched_Raw = mne.preprocessing.compute_current_source_density(notched_Raw) # Perform current source density
+        Raw_Filtered = notched_Raw.filter(LowPass, HighPass, method=filter_method, iir_params = dict(order=4, ftype='butter'),phase='forward',pad=0)
+    if (filter_method == 'fir'):
+        notched_Raw = unfiltered_Raw.filter(1, 100, method=filter_method)  
+        notched_Raw.notch_filter(50, method=filter_method) 
+        if PerformCsd:
+            notched_Raw = mne.preprocessing.compute_current_source_density(notched_Raw) # Perform current source density
+        Raw_Filtered = notched_Raw.filter(LowPass, HighPass, method=filter_method)
+    if params_dict['pipeline_name']=='fbcsp+lda':
+        #extract filterbank feequencies:
+        filters_bands=tuple(params_dict['filters_bands'])
+        filtered_data_band_passed=[]
+        for i,(LowPass,HighPass) in enumerate(filters_bands):
+            unfiltered_Raw=Raw.copy()
+            Raw_Filtered_band= mne.filter.filter_data(unfiltered_Raw.get_data(),sfreq=500, l_freq=LowPass, h_freq=HighPass, method='fir',copy = True)
+            filtered_data_band_passed.append(Raw_Filtered_band)
+    
+    events_from_annot,event_dict = mne.events_from_annotations(Raw_Filtered)
+    events_trigger_dict = {key: event_dict[key] for key in event_dict.keys() if key in params_dict['desired_events']}
+
+    # if events_from_annot is None or len(events_from_annot) == 0:
+    #     print("No events found in this recording. Returning filtered_raw only.")
+    #     filter_bank_epochs = []
+    #     mean_across_epochs = None
+    #     epochs = None
+    #     return Raw_Filtered, epochs, filter_bank_epochs, mean_across_epochs, events_trigger_dict
+
+    print('\n###########################################################')
+    print('extracting event info:',event_dict)
+    
+
+    filtered_electrodes  = [elec for elec in params_dict['Electorde_Group'] if elec not in elecs_to_drop]
+    selected_elecs=filtered_electrodes
+    
+    # Handle the case where there are NO events (e.g., pure idle file)
+    if events_trigger_dict is None or len(events_trigger_dict) == 0:
+        print("No events found in this recording. Returning filtered_raw only.")
+        filter_bank_epochs = []
+        mean_across_epochs = None
+        events_idle = mne.make_fixed_length_events(
+            Raw_Filtered,
+            id=0,
+            start=8.0,     # first event at 4 s -> epoch spans 0..10 s
+            duration=10.0  # events spaced every 10 s
+        )
+
+        # 2) Epoch around these events with the same window as your MI epochs
+        idle_event_id = {'Idle': 0}
+
+        idle_epochs = mne.Epochs(
+            Raw_Filtered,
+            events_idle,
+            event_id=idle_event_id,
+            tmin=-8.0,
+            tmax=6.0,
+            baseline=None,   # same baseline as MI
+            detrend=0,
+            preload=True
+        )
+        idle_epochs.pick(selected_elecs)
+        return Raw_Filtered, idle_epochs, filter_bank_epochs, mean_across_epochs, events_trigger_dict
+
+    if params_dict['pipeline_name']=='fbcsp+lda':
+        #filter bank related: 
+        filter_bank_epochs=[]
+        for filtered_data_band in filtered_data_band_passed:
+            filtered_data_band_raw = mne.io.RawArray(filtered_data_band,unfiltered_Raw.info)
+            epochs = mne.Epochs(filtered_data_band_raw, events_from_annot, preload = True,baseline= None, tmin=tmin, tmax=tmax, event_id=events_trigger_dict,detrend=0)
+            # Calculate the mean across epochs for the current event
+            mean_across_epochs = epochs.get_data().mean(axis=0)
+            event_data = epochs.get_data()         
+            # Subtract the mean from each epoch of the current event
+            centered_event_data = event_data - mean_across_epochs
+            event_epochs= epochs.events
+            epochs = mne.EpochsArray(centered_event_data, epochs.info, events=event_epochs, event_id=epochs.event_id, tmin=epochs.tmin)
+            filter_bank_epochs.append(epochs)
+        
+    
+    epochs = mne.Epochs(Raw_Filtered, events_from_annot, preload = True,baseline= [-2.5,-0.5], tmin=tmin, tmax=tmax, event_id=events_trigger_dict,detrend=0)
+    
+    # If we want to perform auto rejection of epochs (time expensive)
+    #ar = AutoReject()
+    #epochs = ar.fit_transform(epochs)  
+
+    
+    epochs.pick(selected_elecs)
+    ## Centering the data
+
+    centered_data_list = []
+    events_list = []
+    mean_across_epochs = epochs.get_data().mean(axis=0)
+    # Loop through each event ID
+    for idx,event_id in enumerate(params_dict['desired_events']):
+        print (event_id)
+        # Extract epochs for the current event
+        event_epochs = epochs[event_id]
+        event_data = event_epochs.get_data()
+        
+        # Calculate the mean across epochs for the current event
+        mean_across_event_epochs = event_data.mean(axis=0)
+        
+        # Subtract the mean from each epoch of the current event
+        centered_event_data = event_data - mean_across_event_epochs
+        
+        # Store the centered data
+        centered_data_list.append(centered_event_data)
+        
+        # Prepare the events list and event_id_map for the combined EpochsArray
+        events_list.append(event_epochs.events)
+
+    # Concatenate all centered data and events
+    centered_data = np.concatenate(centered_data_list, axis=0)
+    combined_events = np.concatenate(events_list, axis=0)
+
+    # Sort the combined events based on their original occurrence time to preserve the temporal sequence
+    sort_indices = np.argsort(combined_events[:, 0])
+    combined_events = combined_events[sort_indices]
+    centered_data = centered_data[sort_indices]
+
+    # Create a new EpochsArray with the centered data
+    centered_epochs = mne.EpochsArray(centered_data, epochs.info, events=combined_events, event_id=epochs.event_id, tmin=epochs.tmin)
+    epochs = centered_epochs
+
+    #this section drops electrodes after epoching: but currently we drop all bad electrodes from the raw data
+    print('\n###########################################################')
+    print('removing bad channels from epochs:')
+    curr_elecs_in_epochs_set=set(epochs.info['ch_names'])
+    elecs_to_remove=params_dict['bad_electrodes']
+    elecs_to_drop=curr_elecs_in_epochs_set.intersection(elecs_to_remove)
+
+    if len(elecs_to_drop)>0:
+        epochs.info['bads']=elecs_to_drop
+        epochs.drop_channels(epochs.info['bads'])
+        print('\n###########################################################')
+        print(f'Removed: {elecs_to_drop} from the current selected electrodes: {curr_elecs_in_epochs_set} from the overall set of bad electrodes {elecs_to_remove}')
+        print('#############################################################')
+    
+        #filter bank related: 
+        filter_bank_epochs_after_elec_drops=[]
+        for curr_epochs in filter_bank_epochs:
+            curr_epochs.info['bads']=elecs_to_drop
+            curr_epochs.drop_channels(epochs.info['bads'])
+            filter_bank_epochs_after_elec_drops.append(curr_epochs)    
+    elif params_dict['pipeline_name']=='fbcsp+lda': 
+        #filter bank related: 
+        filter_bank_epochs_after_elec_drops=[]
+        for curr_epochs in filter_bank_epochs:
+            filter_bank_epochs_after_elec_drops.append(curr_epochs)  
+
+        print('\n###########################################################')
+        print(f'the current selected electrodes: {curr_elecs_in_epochs_set} allready exclude the requested electrodes to remove {elecs_to_remove}')
+        print('#############################################################')
+
+    return Raw_Filtered,epochs,filter_bank_epochs,mean_across_epochs, events_trigger_dict
 
 def Split_training_validation (epochs,filter_bank_epochs, events_trigger_dict):
 
     data_df=pd.DataFrame(data=epochs.events[:, -1], columns=['label'] ,index=range(len(epochs.events[:, -1])))
     data_df['original_trial_ind']=range(len(epochs.events[:, -1]))
-    train,validation=train_test_split(data_df,shuffle=True,random_state=42,stratify=data_df['label'],test_size=0.2)
+    train,validation=train_test_split(data_df,shuffle=True,random_state=random.randrange(1,80),stratify=data_df['label'],test_size=0.2)
  
     train_inds=train['original_trial_ind'].values
     validation_inds=validation['original_trial_ind'].values
@@ -397,41 +654,67 @@ def Split_training_validation (epochs,filter_bank_epochs, events_trigger_dict):
                 'events_triggers_dict':events_trigger_dict}
     return train_inds,validation_inds,return_dict
 
-def crop_the_data(epochs,train_inds,validation_inds,tmin,tmax,full_epoch_tmin=0,full_epoch_tmax=5):
-    #returns a dictionary containing the cropped and uncropped versions of the validation and training epochs.
-    tmin=float(tmin)
-    tmax=float(tmax)
-    #save uncropped versions of the data: 
-    #save the training data:
-    train_set_data_uncroped=epochs.get_data()[train_inds]
-    train_set_labels_uncroped=epochs.events[train_inds,-1]
+def crop_the_data(epochs,
+                  train_inds,
+                  validation_inds,
+                  tmin,
+                  tmax,
+                  full_epoch_tmin=0,
+                  full_epoch_tmax=5,
+                  use_all_for_training=False):
+    """
+    Returns a dictionary containing cropped and uncropped versions of
+    the training and validation epochs.
 
-    #save the validation data: 
-    validation_set_data_uncroped=epochs.get_data()[validation_inds]
-    validation_Set_labels_uncroped=epochs.events[validation_inds,-1]
+    If use_all_for_training=True:
+        - all epochs are used as training data
+        - validation sets are empty (but still present in the dict)
+    """
+    tmin = float(tmin)
+    tmax = float(tmax)
 
-    #crop the epochs (use the epochs structure)
+    n_epochs = len(epochs)
+
+    # ---- NEW: option to use *all* data for training (for final model) ----
+    if use_all_for_training:
+        train_inds = np.arange(n_epochs)
+        # keep an empty validation set so downstream code doesn't crash
+        validation_inds = np.array([], dtype=int)
+
+    # Get full (uncropped) data and labels once
+    data_uncropped = epochs.get_data()            # shape: (n_epochs, n_ch, n_times_full)
+    labels_uncropped = epochs.events[:, -1]       # event IDs
+
+    # Crop the epochs to the desired window
     epochs_cropped = epochs.copy().crop(tmin=tmin, tmax=tmax)
+    data_cropped = epochs_cropped.get_data()
+    labels_cropped = epochs_cropped.events[:, -1]
 
-    #from here on - we extract the data as matrices (not epoch object anymore):
+    # ---- TRAIN SET ----
+    train_set_data_uncropped = data_uncropped[train_inds]
+    train_set_labels_uncropped = labels_uncropped[train_inds]
 
-    #save the training data:
-    train_set_data=epochs_cropped.get_data()[train_inds]
-    train_set_labels=epochs_cropped.events[train_inds,-1]
+    train_set_data = data_cropped[train_inds]
+    train_set_labels = labels_cropped[train_inds]
 
-    #save the validation data: 
-    validation_set_data=epochs_cropped.get_data()[validation_inds]
-    validation_set_labels=epochs_cropped.events[validation_inds,-1]
+    # ---- VALIDATION SET (may be empty if use_all_for_training=True) ----
+    validation_set_data_uncropped = data_uncropped[validation_inds]
+    validation_Set_labels_uncropped = labels_uncropped[validation_inds]
 
-    return_dict={'train_set_data_uncropped':train_set_data_uncroped,
-                'train_set_labels_uncroped':train_set_labels_uncroped,
-                'validation_set_data_uncropped':validation_set_data_uncroped,
-                'validation_Set_labels_uncropped':validation_Set_labels_uncroped,
-                'epochs_cropped':epochs_cropped,
-                'train_set_data':train_set_data,
-                'train_set_labels':train_set_labels,
-                'validation_set_data':validation_set_data,
-                'validation_set_labels':validation_set_labels}
+    validation_set_data = data_cropped[validation_inds]
+    validation_set_labels = labels_cropped[validation_inds]
+
+    return_dict = {
+        'train_set_data_uncropped': train_set_data_uncropped,
+        'train_set_labels_uncroped': train_set_labels_uncropped,
+        'validation_set_data_uncropped': validation_set_data_uncropped,
+        'validation_Set_labels_uncropped': validation_Set_labels_uncropped,
+        'epochs_cropped': epochs_cropped,
+        'train_set_data': train_set_data,
+        'train_set_labels': train_set_labels,
+        'validation_set_data': validation_set_data,
+        'validation_set_labels': validation_set_labels
+    }
     return return_dict
 
 def augment_data(augmentation_params, data_x_to_augment, y, sfreq):
@@ -479,4 +762,75 @@ def augment_data(augmentation_params, data_x_to_augment, y, sfreq):
     return augmented_x, augmented_y
 
 
+# %%
+from mne.preprocessing import ICA
+
+def run_ica_on_raw(
+    raw,
+    l_freq_ica=1.0,
+    h_freq_ica=None,
+    n_components=25,
+    method='fastica',
+    random_state=97,
+    eog_chs=None,
+    decim=3
+):
+    """
+    Fit ICA on (optionally) filtered copy of raw and open plots for inspection.
+    Returns the fitted ICA object (with .exclude ready for you to edit).
+
+    Parameters
+    ----------
+    raw : mne.io.Raw
+        Original raw object (will NOT be modified).
+    l_freq_ica, h_freq_ica : float | None
+        Band-pass for ICA fitting (often 1–None Hz).
+    n_components : int | None
+        Number of ICA components.
+    method : str
+        ICA method for mne.preprocessing.ICA.
+    eog_chs : list of str | None
+        EOG channel names for automatic EOG component suggestion.
+    decim : int
+        Decimation factor during ICA fitting.
+
+    Returns
+    -------
+    ica : mne.preprocessing.ICA
+        Fitted ICA instance (you decide .exclude afterwards).
+    """
+    print("⏳ Copying & filtering raw for ICA (this does not modify the original raw)...")
+    raw_for_ica = raw.copy().filter(l_freq=l_freq_ica, h_freq=h_freq_ica)
+
+    print("⏳ Fitting ICA...")
+    ica = ICA(
+        n_components=n_components,
+        method=method,
+        random_state=random_state
+    )
+    ica.fit(raw_for_ica, decim=decim)
+    print("✅ ICA fitted.")
+
+    # Optional: try to automatically mark EOG-related components
+    if eog_chs is not None and len(eog_chs) > 0:
+        print(f"🔍 Searching for EOG-related components using channels: {eog_chs}")
+        eog_inds, eog_scores = ica.find_bads_eog(raw_for_ica, ch_name=eog_chs)
+        print(f"Suggested EOG components: {eog_inds}")
+        ica.exclude = eog_inds  # you can change this later
+        ica.plot_scores(eog_scores)
+
+    # Visual inspection: you will interact with these in the notebook
+    print("📈 Plotting ICA components (topographies)...")
+    ica.plot_components()  # click components to inspect
+
+    print("📈 Plotting IC time courses on a short segment...")
+    ica.plot_sources(raw_for_ica, start=0, stop=60)  # adjust window as needed
+
+    print(
+        "\nNow inspect the plots and manually update:"
+        "\n    ica.exclude = [comp_idx1, comp_idx2, ...]"
+        "\nwhen you are satisfied. Then pass this `ica` to the next stage."
+    )
+
+    return ica
 # %%
