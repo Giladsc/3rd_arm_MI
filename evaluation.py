@@ -128,7 +128,7 @@ def plot_accuracy_over_time(scores_windows, w_times, params_dict=None, axes_hand
     axes_handle.set_ylabel('Classification Accuracy')
     axes_handle.set_title('Classification Score Over Time')
     axes_handle.set_ylim([0.2, 1])
-    axes_handle.set_xlim([-6, 5])  # Adjust the x-axis limits to extend to 5 seconds
+    axes_handle.set_xlim([np.min(w_times), np.max(w_times)])  # Derive xlim from w_times
     axes_handle.legend()
     axes_handle.grid(True)
 
@@ -371,3 +371,5 @@ def plot_confusion_matrix(conf_mat, class_labels, title="Confusion Matrix"):
     plt.ylabel("True Labels")
     plt.title(title)
     plt.show()
+
+# %%

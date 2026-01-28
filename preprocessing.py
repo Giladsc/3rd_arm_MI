@@ -212,7 +212,11 @@ def get_subject_bad_electrodes(subject):
                     'Fudge':{'Iz','FT10', 'TP10', 'FT9', 'TP9','F1'},
                     'g': {'T7','CP1','TP9','P7','PO7','O1'},
                     'Ron': {'Iz','Cz'},                   
-                    'GiladRSL' : {'C5','FC4','CP5','T7',}}
+                    'GiladRSL' : {'C5','FC4','CP5','T7',},
+                    'NoamV' : {'Iz', 'T7','O1','O2','Oz'},
+                    'DD' : {'T7','P4','Iz','FT8','P5','FT10', 'TP10'},
+                    'JE' : {'T7','TP9','Iz','TP7','FT7'}
+                }
     if subject in bad_elecs_dict.keys():
         subject_bad_electrodes=bad_elecs_dict[subject]
     else: 
@@ -276,6 +280,7 @@ def Post_ICA_EEG_Preprocessing (current_path,raw, params_dict):
     LowPass, HighPass, filter_method = params_dict['LowPass'],params_dict['HighPass'],params_dict['filter_method']
     tmin=params_dict['epoch_tmin']
     tmax=params_dict['epoch_tmax']
+    filter_bank_epochs = None
     Raw = raw
     print('\n###########################################################')
     print('filtering the data')  
@@ -314,9 +319,8 @@ def Post_ICA_EEG_Preprocessing (current_path,raw, params_dict):
     print('\n###########################################################')
     print('extracting event info:',event_dict)
     
-
-    filtered_electrodes  = [elec for elec in params_dict['Electorde_Group'] if elec not in elecs_to_drop]
-    selected_elecs=filtered_electrodes
+    #filtered_electrodes  = [elec for elec in params_dict['Electorde_Group'] if elec not in elecs_to_drop]
+    #selected_elecs=filtered_electrodes
     
     # Handle the case where there are NO events (e.g., pure idle file)
     if events_trigger_dict is None or len(events_trigger_dict) == 0:
@@ -362,14 +366,14 @@ def Post_ICA_EEG_Preprocessing (current_path,raw, params_dict):
             filter_bank_epochs.append(epochs)
         
     
-    epochs = mne.Epochs(Raw_Filtered, events_from_annot, preload = True,baseline= [-2.5,-0.5], tmin=tmin, tmax=tmax, event_id=events_trigger_dict,detrend=0)
+    epochs = mne.Epochs(Raw_Filtered, events_from_annot, preload = True,baseline= None, tmin=tmin, tmax=tmax, event_id=events_trigger_dict,detrend=0)
     
     # If we want to perform auto rejection of epochs (time expensive)
     #ar = AutoReject()
     #epochs = ar.fit_transform(epochs)  
 
     
-    epochs.pick(selected_elecs)
+    #epochs.pick(selected_elecs)
     ## Centering the data
 
     centered_data_list = []

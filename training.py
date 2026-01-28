@@ -359,9 +359,11 @@ def run_windowed_classification_aug_cv(epochs, epochs_cropped, cv_split, params_
         scores_windows.append(curr_scores_windows)
         folds_confusion_matrices_per_window.append(confusion_matrices_per_window)
 
-    # Window center times (s) relative to epoch_tmin
-    w_times = (w_start + w_length / 2.0) / sfreq + params_dict['epoch_tmin']
 
+    
+    # Window center times (s) relative to epoch_tmin
+    w_times = (w_start + w_length ) / sfreq + params_dict['epoch_tmin']
+    
     return scores_windows, folds_confusion_matrices_per_window, w_times
 
 def run_windowed_classification_aug(epochs_cropped,train_set_data,train_set_labels,train_set_data_uncroped,test_y,params_dict,BinaryClassification):
@@ -373,7 +375,7 @@ def run_windowed_classification_aug(epochs_cropped,train_set_data,train_set_labe
     w_length = int(sfreq * win_len)   # running classifier: window length
     w_step = int(sfreq * win_step)  # running classifier: window step size
     w_start = np.arange(0, train_set_data_uncroped.shape[2] - w_length, w_step)
-    w_times = (w_start + w_length / 2.) / sfreq + params_dict['epoch_tmin']
+    w_times = (w_start + w_length ) / sfreq + params_dict['epoch_tmin']
 
     augmented_x,augmented_y=augment_data(augmentation_params,train_set_data,train_set_labels,sfreq)
     scores_windows,confusion_metrices_per_window,trained_clf=run_windowed_classification_on_fold(augmented_x,augmented_y,train_set_data_uncroped,test_y,params_dict,w_start,w_length, BinaryClassification)         
