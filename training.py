@@ -361,7 +361,7 @@ def run_windowed_classification_aug_cv(epochs, epochs_cropped, cv_split, params_
 
 
     
-    # Window center times (s) relative to epoch_tmin
+    # Window end times (s) relative to epoch_tmin — time when prediction is made after processing full window
     w_times = (w_start + w_length ) / sfreq + params_dict['epoch_tmin']
     
     return scores_windows, folds_confusion_matrices_per_window, w_times
@@ -375,6 +375,7 @@ def run_windowed_classification_aug(epochs_cropped,train_set_data,train_set_labe
     w_length = int(sfreq * win_len)   # running classifier: window length
     w_step = int(sfreq * win_step)  # running classifier: window step size
     w_start = np.arange(0, train_set_data_uncroped.shape[2] - w_length, w_step)
+    # Window end times (s) relative to epoch_tmin — time when prediction is made after processing full window
     w_times = (w_start + w_length ) / sfreq + params_dict['epoch_tmin']
 
     augmented_x,augmented_y=augment_data(augmentation_params,train_set_data,train_set_labels,sfreq)
