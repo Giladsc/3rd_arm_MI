@@ -215,7 +215,8 @@ def get_subject_bad_electrodes(subject):
                     'GiladRSL' : {'C5','FC4','CP5','T7',},
                     'NoamV' : {'Iz', 'T7','O1','O2','Oz'},
                     'DD' : {'T7','P4','Iz','FT8','P5','FT10', 'TP10'},
-                    'JE' : {'T7','TP9','Iz','TP7','FT7'}
+                    'JE' : {'T7','TP9','Iz','TP7','FT7'},
+                    'NC' : {'CP5', 'AF8','AF7','Iz'}
                 }
     if subject in bad_elecs_dict.keys():
         subject_bad_electrodes=bad_elecs_dict[subject]
