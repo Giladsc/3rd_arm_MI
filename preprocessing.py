@@ -212,11 +212,12 @@ def get_subject_bad_electrodes(subject):
                     'Fudge':{'Iz','FT10', 'TP10', 'FT9', 'TP9','F1'},
                     'g': {'T7','CP1','TP9','P7','PO7','O1'},
                     'Ron': {'Iz','Cz'},                   
-                    'GiladRSL' : {'C5','FC4','CP5','T7',},
+                    'GiladRSL' : {'C5','FC4','CP5','T7','FT9','FT10','TP9','TP10','T8'},
                     'NoamV' : {'Iz', 'T7','O1','O2','Oz'},
-                    'DD' : {'T7','P4','Iz','FT8','P5','FT10', 'TP10'},
-                    'JE' : {'T7','TP9','Iz','TP7','FT7'},
-                    'NC' : {'CP5', 'AF8','AF7','Iz'}
+                    'DD' : {'Cz','CP5','FC2','T7','P4','Iz','FT8','P5','FT10', 'TP10'},
+                    'JE' : {'T7','TP9','Iz','TP7','FT7','CP5','CP1'},
+                    'NC' : {'CP5', 'AF8','AF7','Iz'},
+                    'Tomer' : {'FC5','CP1','F4','TP9','FT8','P5'}
                 }
     if subject in bad_elecs_dict.keys():
         subject_bad_electrodes=bad_elecs_dict[subject]
@@ -445,7 +446,7 @@ def Post_ICA_EEG_Preprocessing (current_path,raw, params_dict):
     return Raw_Filtered,epochs,filter_bank_epochs,mean_across_epochs, events_trigger_dict
 
 
-def EEG_Preprocessing (current_path,raw, params_dict):
+def EEG_Preprocessing (current_path,raw, params_dict, pick_channels=True):
 
     #extract the current run paramaters: 
     PerformCsd=params_dict['PerformCsd']
@@ -571,7 +572,8 @@ def EEG_Preprocessing (current_path,raw, params_dict):
     #epochs = ar.fit_transform(epochs)  
 
     
-    epochs.pick(selected_elecs)
+    if pick_channels:
+        epochs.pick(selected_elecs)
     ## Centering the data
 
     centered_data_list = []
@@ -838,4 +840,226 @@ def run_ica_on_raw(
     )
 
     return ica
+
+# %%
+def run_ica_on_epochs(
+    epochs,
+    n_components=25,
+    method='fastica',
+    random_state=97,
+    eog_chs=None,
+    decim=3,
+    iclabel_threshold=0.5,
+    exclude_labels=('eye blink', 'eye movement', 'muscle artifact',
+                    'heart beat', 'line noise', 'channel noise')
+):
+    """
+    Fit ICA on a temporary Raw constructed from concatenated epoch data,
+    auto-label every component with ICLabel, and pre-populate
+    ``ica.exclude`` with non-brain artifacts.
+
+    Assumes the epochs are already preprocessed (filtered, bad channels
+    removed, etc.) — no additional filtering is applied.
+
+    The workflow is interactive:
+      1. A pseudo-Raw is built from the epoch data so ICA can be fitted.
+      2. ICLabel classifies each component and those whose predicted
+         artifact probability exceeds *iclabel_threshold* are added to
+         ``ica.exclude``.
+      3. Component topographies, time-courses, and the label bar-chart
+         are plotted for manual review.
+      4. The user can override ``ica.exclude`` in the notebook before
+         calling ``apply_ica_to_epochs``.
+
+    Parameters
+    ----------
+    epochs : mne.Epochs | mne.EpochsArray
+        The (combined, already preprocessed) epochs to clean.  Must be preloaded.
+    n_components : int | None
+        Number of ICA components to estimate.
+    method : str
+        ICA algorithm (default ``'fastica'``).
+    random_state : int
+        Random seed for reproducibility.
+    eog_chs : list of str | None
+        Channel names treated as EOG for automatic component suggestion
+        (used as fallback alongside ICLabel).
+    decim : int
+        Decimation factor during ICA fitting (trades speed for precision).
+    iclabel_threshold : float
+        Probability threshold (0–1) above which a component is considered
+        an artifact and added to ``ica.exclude``.  Default 0.5.
+    exclude_labels : tuple of str
+        ICLabel class names to treat as artifacts.  Components whose
+        highest-probability label is in this set *and* exceeds
+        *iclabel_threshold* will be auto-excluded.
+
+    Returns
+    -------
+    ica : mne.preprocessing.ICA
+        Fitted ICA instance with ``.exclude`` pre-populated.
+        Inspect the plots, adjust if needed, then call
+        ``apply_ica_to_epochs(ica, epochs)``.
+    labels_df : pandas.DataFrame
+        Per-component predicted probabilities for every ICLabel class.
+    """
+    from mne_icalabel import label_components
+
+    # Build a continuous Raw from the epoch data so ICA.fit() works
+    data = epochs.get_data()                        # (n_epochs, n_ch, n_times)
+    data_concat = data.transpose(1, 0, 2).reshape(len(epochs.ch_names), -1)
+    raw_from_epochs = mne.io.RawArray(data_concat, epochs.info.copy())
+
+    print("Fitting ICA on epoch data (already preprocessed, no extra filtering)...")
+    ica = ICA(
+        n_components=n_components,
+        method=method,
+        random_state=random_state
+    )
+    ica.fit(raw_from_epochs, decim=decim)
+    print(f"ICA fitted  ({ica.n_components_} components).")
+
+    # ---- ICLabel automatic labelling ----
+    print("Running ICLabel auto-classification...")
+    label_dict = label_components(raw_from_epochs, ica, method='iclabel')
+
+    ic_labels = label_dict['labels']          # list of str per component
+    ic_probs  = label_dict['y_pred_proba']    # (n_components, 7) array
+
+    # Debug: Check what we actually got
+    print(f"DEBUG: ic_probs type = {type(ic_probs)}")
+    print(f"DEBUG: ic_probs shape = {ic_probs.shape}")
+    print(f"DEBUG: ic_probs ndim = {ic_probs.ndim}")
+    print(f"DEBUG: label_dict keys = {label_dict.keys()}")
+
+    class_names = ['brain', 'muscle artifact', 'eye blink',
+                   'heart beat', 'line noise', 'channel noise', 'other']
+
+    # Handle different output formats
+    # First check if it's 1D and reshape if needed
+    if ic_probs.ndim == 1:
+        print("DEBUG: Reshaping 1D array to 2D")
+        ic_probs = ic_probs.reshape(-1, 1)
+
+    if ic_probs.shape[1] == 7:
+        labels_df = pd.DataFrame(ic_probs, columns=class_names)
+    elif ic_probs.shape[1] == 1:
+        # Only one probability column - likely just the max probability
+        # Try to get the full probability matrix from another key
+        if 'y_pred_proba_full' in label_dict:
+            ic_probs = label_dict['y_pred_proba_full']
+            labels_df = pd.DataFrame(ic_probs, columns=class_names)
+        else:
+            # Fallback: create a simple dataframe with just the labels
+            print("WARNING: Full probability matrix not available, using labels only")
+            labels_df = pd.DataFrame({'predicted_label': ic_labels})
+            labels_df.index.name = 'IC'
+            # Skip inserting predicted_label again below
+            ic_probs = None
+    else:
+        raise ValueError(f"Unexpected ic_probs shape: {ic_probs.shape}")
+
+    if ic_probs is not None and ic_probs.shape[1] == 7:
+        labels_df.insert(0, 'predicted_label', ic_labels)
+        labels_df.index.name = 'IC'
+
+        # Auto-exclude components labelled as artifacts above threshold
+        auto_exclude = []
+        for idx, (label, prob_row) in enumerate(zip(ic_labels, ic_probs)):
+            if label in exclude_labels and prob_row.max() >= iclabel_threshold:
+                auto_exclude.append(idx)
+    else:
+        # Fallback: just exclude based on label names without probability threshold
+        auto_exclude = []
+        for idx, label in enumerate(ic_labels):
+            if label in exclude_labels:
+                auto_exclude.append(idx)
+
+    ica.exclude = auto_exclude
+
+    print("\n--- ICLabel results ---")
+    print(labels_df.to_string())
+    print(f"\nAuto-excluded (threshold={iclabel_threshold}): {auto_exclude}")
+
+    # ---- Fallback / additional EOG detection ----
+    if eog_chs is not None and len(eog_chs) > 0:
+        present = [ch for ch in eog_chs if ch in epochs.ch_names]
+        if present:
+            print(f"Also checking EOG channels: {present}")
+            eog_inds, eog_scores = ica.find_bads_eog(raw_from_epochs, ch_name=present)
+            for ind in eog_inds:
+                if ind not in ica.exclude:
+                    ica.exclude.append(ind)
+            print(f"EOG-based suggestions added: {eog_inds}")
+            ica.plot_scores(eog_scores)
+
+    # ---- Visual inspection ----
+    print("Plotting ICA component topographies...")
+    ica.plot_components()
+
+    print("Plotting IC time-courses (first 60 s of pseudo-Raw)...")
+    ica.plot_sources(raw_from_epochs, start=0, stop=60)
+
+    # Bar chart of ICLabel probabilities (only if we have full probabilities)
+    if ic_probs is not None and ic_probs.shape[1] == 7:
+        fig, ax = plt.subplots(figsize=(12, 4))
+        labels_df[class_names].plot.bar(stacked=True, ax=ax, colormap='Set2')
+        ax.set_ylabel('Probability')
+        ax.set_xlabel('IC component')
+        ax.set_title('ICLabel classification')
+        ax.legend(loc='upper right', fontsize=8)
+        for idx in ica.exclude:
+            ax.get_children()[idx].set_edgecolor('red')
+            ax.get_children()[idx].set_linewidth(2)
+        plt.tight_layout()
+        plt.show()
+    else:
+        print("\nNote: Probability bar chart skipped (full probabilities not available)")
+
+    print(
+        f"\nica.exclude = {ica.exclude}  (auto-set by ICLabel)\n"
+        "Review the plots and adjust if needed, then call:\n"
+        "    epochs = apply_ica_to_epochs(ica, epochs)"
+    )
+    return ica, labels_df
+
+
+def apply_ica_to_epochs(ica, epochs):
+    """
+    Project out the excluded ICA components from *epochs* and return a
+    new EpochsArray with cleaned data.
+
+    Parameters
+    ----------
+    ica : mne.preprocessing.ICA
+        Fitted ICA with ``.exclude`` set.
+    epochs : mne.Epochs | mne.EpochsArray
+        Original (uncleaned) epochs.
+
+    Returns
+    -------
+    cleaned_epochs : mne.EpochsArray
+        New EpochsArray with the excluded components removed.
+    """
+    print(f"Applying ICA — removing components: {ica.exclude}")
+
+    # Build temporary Raw, apply ICA, reshape back to epochs
+    data = epochs.get_data()                        # (n_epochs, n_ch, n_times)
+    n_epochs, n_ch, n_times = data.shape
+    data_concat = data.transpose(1, 0, 2).reshape(n_ch, -1)
+    raw_tmp = mne.io.RawArray(data_concat, epochs.info.copy())
+
+    ica.apply(raw_tmp)
+
+    cleaned_data = raw_tmp.get_data().reshape(n_ch, n_epochs, n_times).transpose(1, 0, 2)
+
+    cleaned_epochs = mne.EpochsArray(
+        cleaned_data,
+        epochs.info.copy(),
+        events=epochs.events.copy(),
+        event_id=epochs.event_id,
+        tmin=epochs.tmin
+    )
+    print(f"Done — returned {n_epochs} cleaned epochs.")
+    return cleaned_epochs
 # %%
