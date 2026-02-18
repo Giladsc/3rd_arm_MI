@@ -1,4 +1,24 @@
-Data
-Models
-Recordings
-_pycache_
+# Data & recordings (large binary files)
+Data/
+Models/
+Recordings/
+TFRs/
+
+# Generated outputs
+Figures/
+hyper_param_search_outputs/
+
+# Scratch/temp files
+foo.csv
+return_df.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
