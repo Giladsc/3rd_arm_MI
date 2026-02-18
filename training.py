@@ -139,7 +139,7 @@ class ShallowFBCSPNetWrapper:
         return np.mean(preds == y)
 
 def classifier_training(fold_train_data_x,fold_train_data_y,params_dict, BinaryClassification = False):
-    #note that this is currently the  function that really does the classification and extracts the performence measure (the previous calls to run_lda.... for example, are just tests)
+    #note that this is currently the  function that really does the classification and extracts the performance measure (the previous calls to run_lda.... for example, are just tests)
     curr_classifier_name=params_dict['pipeline_name']
     csp = lda = None
     if curr_classifier_name=='csp+lda':  
