@@ -395,3 +395,60 @@ def run_windowed_classification_on_fold(fold_train_data_x,fold_train_data_y,fold
     else:
         fold_windowed_scores,confusion_matrices_per_window=run_windowed_pretrained_classifier(clf,fold_test_data_x_uncropped,fold_test_data_y_labels,w_start,w_length)
     return fold_windowed_scores,confusion_matrices_per_window
+
+
+def sanity_check_trained_clf(trained_clf, epochs, params_dict, BinaryClassification=False):
+    """
+    Sanity-check a pre-trained classifier using the windowed prediction approach
+    on the provided (uncropped) epochs — same method used in CV evaluation.
+
+    Parameters
+    ----------
+    trained_clf : fitted sklearn Pipeline / classifier
+        The classifier to evaluate (e.g. from classifier_training()).
+    epochs : mne.Epochs
+        UNCROPPED epochs to evaluate on (the full trial length).
+    params_dict : dict
+        Must contain:
+        - 'windowed_prediction_params': {'win_len': float, 'win_step': float}
+        - 'epoch_tmin': float
+        - 'events_trigger_dict': {str: int} mapping event names to trigger codes
+    BinaryClassification : bool
+        If True, collapse MI classes into a single 'motor_imagery' label.
+
+    Returns
+    -------
+    scores_windows : list of float
+        Accuracy at each time window.
+    confusion_matrices_per_window : list of (cm, classes) tuples
+        Confusion matrix and class labels at each time window.
+    w_times : np.ndarray
+        Time (in seconds, relative to epoch onset) for each window.
+    """
+    windowed_prediction_params = params_dict['windowed_prediction_params']
+    win_len = float(windowed_prediction_params['win_len'])
+    win_step = float(windowed_prediction_params['win_step'])
+
+    sfreq = epochs.info['sfreq']
+    epochs_data = epochs.get_data()
+
+    w_length = int(round(sfreq * win_len))
+    w_step_samp = int(round(sfreq * win_step))
+    w_start = np.arange(0, epochs_data.shape[2] - w_length + 1, w_step_samp)
+
+    # Map integer trigger codes to string labels
+    triggers_label_dict = {val: key for key, val in params_dict['events_trigger_dict'].items()}
+    y_labels = np.array([triggers_label_dict[code] for code in epochs.events[:, -1]])
+
+    if BinaryClassification:
+        A, B, C = 'RightHand', 'LeftHand', 'ClosePalm'
+        y_labels = np.array(['motor_imagery' if label in [A, B, C] else label for label in y_labels])
+
+    scores_windows, confusion_matrices_per_window = run_windowed_pretrained_classifier(
+        trained_clf, epochs_data, y_labels, w_start, w_length
+    )
+
+    w_times = (w_start + w_length) / sfreq + params_dict['epoch_tmin']
+
+    # Wrap in a list to match the CV output format (list of folds)
+    return [scores_windows], [confusion_matrices_per_window], w_times

@@ -25,7 +25,7 @@ from autoreject import AutoReject
 
 # XDF file format support in MNE
 import pyxdf
-from mne_import_xdf import *
+from .mne_import_xdf import *
 
 # Scikit-learn and Pyriemann for feature extraction and machine learning functionalities
 from sklearn.metrics import f1_score
@@ -78,7 +78,7 @@ import torch
 
 
 
-from training import *
+from .training import *
 # %%
 def plot_accuracy_over_time(scores_windows, w_times, params_dict=None, axes_handle=None):
     import numpy as np
@@ -99,7 +99,7 @@ def plot_accuracy_over_time(scores_windows, w_times, params_dict=None, axes_hand
     # Convert scores_windows to long-form DataFrame
     # Adjust the time range (extend to 5 seconds)
     times_col_names = [np.round(w_times[s], 2) for s in range(len(w_times))]
-    scores_windows_array = np.squeeze(np.array(scores_windows))
+    scores_windows_array = np.atleast_2d(np.array(scores_windows))
     if scores_windows_array.shape[1] != len(w_times):
         raise ValueError("Mismatch between scores_windows columns and w_times length.")
     
@@ -371,5 +371,57 @@ def plot_confusion_matrix(conf_mat, class_labels, title="Confusion Matrix"):
     plt.ylabel("True Labels")
     plt.title(title)
     plt.show()
+
+
+def plot_average_confusion_fixed_cv(folds_conf_matrices_per_window, w_times, t_start, t_end, normalize=True):
+    """
+    Plot average confusion matrix across CV folds and time windows within a time range.
+
+    Parameters
+    ----------
+    folds_conf_matrices_per_window : list of lists of (cm, classes) tuples
+        Output from run_windowed_classification_aug_cv or sanity_check_trained_clf.
+        Outer list = folds, inner list = time windows.
+    w_times : np.ndarray
+        Time (s) for each window.
+    t_start : float
+        Start of time range (seconds).
+    t_end : float
+        End of time range (seconds).
+    normalize : bool
+        If True, normalize rows to sum to 1 (proportions). Default True.
+    """
+    # Convert time range to window indices
+    mask = (w_times >= t_start) & (w_times <= t_end)
+    window_indices = list(np.where(mask)[0])
+
+    if len(window_indices) == 0:
+        raise ValueError(f"No windows found between {t_start}s and {t_end}s. "
+                         f"w_times range: [{w_times[0]:.2f}, {w_times[-1]:.2f}]")
+
+    all_matrices = []
+    for fold in folds_conf_matrices_per_window:
+        for w_idx in window_indices:
+            cm, _ = fold[w_idx]
+            all_matrices.append(cm)
+
+    avg_matrix = np.mean(all_matrices, axis=0)
+    labels = folds_conf_matrices_per_window[0][window_indices[0]][1]
+
+    if normalize:
+        avg_matrix = avg_matrix / avg_matrix.sum(axis=1, keepdims=True)
+        avg_matrix = np.nan_to_num(avg_matrix)
+
+    disp = ConfusionMatrixDisplay(confusion_matrix=avg_matrix, display_labels=labels)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    disp.plot(cmap='Blues', ax=ax, values_format=".2f")
+
+    time_start = np.round(w_times[window_indices[0]], 2)
+    time_end = np.round(w_times[window_indices[-1]], 2)
+    ax.set_title(f"Avg Confusion Matrix (Time {time_start}\u2013{time_end}s)")
+    plt.grid(False)
+    plt.show()
+
+    return avg_matrix, labels
 
 # %%

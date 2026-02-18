@@ -5,7 +5,8 @@
       "Bash(python3:*)",
       "Bash(ls:*)",
       "Bash(git rm:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(git mv:*)"
     ]
   }
 }

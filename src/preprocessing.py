@@ -22,7 +22,7 @@ from mne.decoding import CSP
 
 # XDF file format support in MNE
 import pyxdf
-from mne_import_xdf import *
+from .mne_import_xdf import *
 
 # Scikit-learn and Pyriemann for feature extraction and machine learning functionalities
 from sklearn.metrics import f1_score
@@ -75,8 +75,66 @@ import torch
 
 
 
-from preprocessing import *
-from evaluation import *
+from .evaluation import *
+
+#%%
+standard_event_id = {'FixatedRest': 1,'ActiveRest': 11, 'OpenPalm': 2, 'ClosePalm':33, 'Rating': 4,'Rest': 55,'Long Break': 6,'RightHand' : 7, 'LeftHand' : 8, 'Idle': 0, 'Right': 77,'Left': 88}
+
+def remap_epoch_events_to_standard(epochs, standard_event_id, desired_events):
+    """
+    Remap event codes to standard_event_id, keep only desired events,
+    and strictly preserve the original epochs.event_id order.
+    """
+    original_order = [key for key in epochs.event_id if key in desired_events]
+    val_to_label = {val: label for label, val in epochs.event_id.items()}
+
+    new_events = epochs.events.copy()
+    for i, code in enumerate(new_events[:, 2]):
+        label = val_to_label[code]
+        new_events[i, 2] = standard_event_id[label]
+
+    epochs.events = new_events
+    epochs.event_id = OrderedDict((label, standard_event_id[label]) for label in original_order)
+
+    return epochs
+
+
+def balance_epochs_by_subsampling(epochs, class_to_subsample='Rating'):
+    """
+    Subsamples the specified class to match the smallest number of epochs in other classes.
+
+    Parameters
+    ----------
+    epochs : mne.Epochs
+        Epochs object with labeled events.
+    class_to_subsample : str
+        Class label to downsample.
+
+    Returns
+    -------
+    balanced_epochs : mne.Epochs
+        New Epochs object with balanced classes.
+    """
+    event_id = epochs.event_id
+    all_classes = list(event_id.keys())
+
+    class_counts = {label: len(epochs[label]) for label in all_classes if label != class_to_subsample}
+    min_count = min(class_counts.values())
+
+    selected_indices = []
+    for label in all_classes:
+        picks = epochs[label].selection
+        if label == class_to_subsample:
+            picked = np.random.choice(picks, size=min_count, replace=False)
+        else:
+            picked = picks
+        selected_indices.extend(picked)
+
+    selected_indices = np.sort(selected_indices)
+    balanced_epochs = epochs[selected_indices]
+
+    return balanced_epochs
+
 #%%
 def Load_and_concatenate_xdf(xdf_files, scale_to_mv=True):
     """
