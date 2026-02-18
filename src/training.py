@@ -21,7 +21,7 @@ from mne.datasets import eegbci
 
 # XDF file format support in MNE
 import pyxdf
-from mne_import_xdf import *
+from .mne_import_xdf import *
 
 # Scikit-learn and Pyriemann for feature extraction and machine learning functionalities
 from sklearn.metrics import f1_score
@@ -73,7 +73,7 @@ from braindecode.training.scoring import trial_preds_from_window_preds
 from torch.optim import Adam
 from torch.utils.data import DataLoader
 import torch
-from preprocessing import *
+from .preprocessing import *
 
 #%%
 class ShallowFBCSPNetWrapper:
@@ -282,7 +282,7 @@ def run_windowed_classification_aug_cv(epochs, epochs_cropped, cv_split, params_
                        - optionally 'binary_positive_classes' for BinaryClassification
     BinaryClassification: bool
     """
-    from preprocessing import augment_data
+    from .preprocessing import augment_data
 
     augmentation_params = params_dict['augmentation_params']
     windowed_prediction_params = params_dict['windowed_prediction_params']
