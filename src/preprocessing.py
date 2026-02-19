@@ -75,8 +75,6 @@ import torch
 
 
 
-from .evaluation import *
-
 #%%
 standard_event_id = {'FixatedRest': 1,'ActiveRest': 11, 'OpenPalm': 2, 'ClosePalm':33, 'Rating': 4,'Rest': 55,'Long Break': 6,'RightHand' : 7, 'LeftHand' : 8, 'Idle': 0, 'Right': 77,'Left': 88}
 
@@ -97,6 +95,55 @@ def remap_epoch_events_to_standard(epochs, standard_event_id, desired_events):
     epochs.event_id = OrderedDict((label, standard_event_id[label]) for label in original_order)
 
     return epochs
+
+
+def expand_triggers_to_events(ann, raw=None, recording_end=None, use_raw_timebase=True):
+    """
+    Turn trigger annotations (point markers) into event intervals:
+    each trigger's label lasts until the next trigger onset.
+
+    Parameters
+    ----------
+    ann : mne.Annotations
+        Trigger-like annotations (often duration=0).
+    raw : mne.io.BaseRaw or None
+        If given, we'll use raw.times[-1] as the end of recording and (optionally)
+        align orig_time to raw.info['meas_date'].
+    recording_end : float or None
+        End time in seconds (from recording start). If None, inferred from `raw`.
+    use_raw_timebase : bool
+        If True and `raw` is provided, set orig_time to raw.info['meas_date'] so
+        plotting aligns perfectly with `raw`.
+
+    Returns
+    -------
+    events_ann : mne.Annotations
+        Annotations whose durations now extend to the next trigger (last to end).
+    """
+    if recording_end is None:
+        if raw is None:
+            raise ValueError("Provide either `raw` or `recording_end` (seconds).")
+        recording_end = float(raw.times[-1])
+
+    on = np.asarray(ann.onset, float)
+    desc = np.asarray(ann.description, dtype=object)
+
+    order = np.argsort(on, kind="mergesort")
+    on = on[order]
+    desc = desc[order]
+
+    if len(on) == 0:
+        base_time = raw.info['meas_date'] if (use_raw_timebase and raw is not None) else ann.orig_time
+        return mne.Annotations([], [], [], orig_time=base_time)
+
+    next_on = np.r_[on[1:], recording_end]
+    dur = next_on - on
+
+    keep = dur > 0
+    on, dur, desc = on[keep], dur[keep], desc[keep]
+
+    base_time = raw.info['meas_date'] if (use_raw_timebase and raw is not None) else ann.orig_time
+    return mne.Annotations(on, dur, desc.tolist(), orig_time=base_time)
 
 
 def balance_epochs_by_subsampling(epochs, class_to_subsample='Rating'):

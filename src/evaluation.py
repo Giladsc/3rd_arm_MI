@@ -5,7 +5,7 @@ import warnings
 warnings.filterwarnings('ignore')
 import logging
 import os,numpy as np,pandas as pd
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 import seaborn as sns
 from matplotlib import pyplot as plt
 import itertools
@@ -76,9 +76,105 @@ from torch.utils.data import DataLoader
 import torch
 
 
+def get_epoch_events(epochs):
+    """Get the list of event names for each epoch.
+
+    Parameters
+    ----------
+    epochs : mne.Epochs
+        Epochs object with labeled events.
+
+    Returns
+    -------
+    epoch_event_names : np.ndarray of str
+        Event name for every epoch, in order.
+    """
+    events = epochs.events
+    event_ids = epochs.event_id
+    epoch_event_names = []
+    for event in events:
+        event_code = event[-1]
+        event_name = [key for key, val in event_ids.items() if val == event_code][0]
+        epoch_event_names.append(event_name)
+    return np.array(epoch_event_names)
 
 
-from .training import *
+def compare_events(actual_events, predicted_events):
+    """Compare actual event names with predicted event names and summarise mismatches.
+
+    Parameters
+    ----------
+    actual_events : array-like of str
+        Ground-truth event labels.
+    predicted_events : array-like of str
+        Predicted event labels (same length).
+
+    Returns
+    -------
+    dict with keys 'accuracy', 'mismatch_details' (list of str), 'mismatch_counts' (Counter).
+    """
+    comparison = actual_events == predicted_events
+    accuracy = np.mean(comparison)
+    mismatches = np.where(comparison == False)[0]
+
+    mismatch_details = []
+    mismatch_counts = Counter()
+    for idx in mismatches:
+        actual = actual_events[idx]
+        predicted = predicted_events[idx]
+        mismatch_details.append(f"{idx + 1} - {actual} (actual), {predicted} (predicted)")
+        mismatch_counts[f"{actual} -> {predicted}"] += 1
+
+    return {
+        'accuracy': accuracy,
+        'mismatch_details': mismatch_details,
+        'mismatch_counts': mismatch_counts,
+    }
+
+
+def compare_events_without_rest(actual_events, predicted_events, rest_label='Rest'):
+    """Compare actual vs predicted events, excluding *rest_label* epochs from accuracy.
+
+    Parameters
+    ----------
+    actual_events : array-like of str
+        Ground-truth event labels.
+    predicted_events : array-like of str
+        Predicted event labels (same length).
+    rest_label : str
+        Label to exclude from the accuracy calculation.
+
+    Returns
+    -------
+    dict with keys 'accuracy', 'total_non_rest_epochs', 'mismatch_details', 'mismatch_counts'.
+    """
+    non_rest_mask = actual_events != rest_label
+    non_rest_indices = np.where(non_rest_mask)[0]
+
+    actual_non_rest = actual_events[non_rest_mask]
+    predicted_non_rest = predicted_events[non_rest_mask]
+
+    comparison = actual_non_rest == predicted_non_rest
+    accuracy = np.mean(comparison)
+    mismatches = np.where(comparison == False)[0]
+
+    mismatch_details = []
+    mismatch_counts = Counter()
+    for mismatch_idx in mismatches:
+        original_idx = non_rest_indices[mismatch_idx]
+        actual = actual_non_rest[mismatch_idx]
+        predicted = predicted_non_rest[mismatch_idx]
+        mismatch_details.append(f"{original_idx + 1} - {actual} (actual), {predicted} (predicted)")
+        mismatch_counts[f"{actual} -> {predicted}"] += 1
+
+    return {
+        'accuracy': accuracy,
+        'total_non_rest_epochs': len(actual_non_rest),
+        'mismatch_details': mismatch_details,
+        'mismatch_counts': mismatch_counts,
+    }
+
+
 # %%
 def plot_accuracy_over_time(scores_windows, w_times, params_dict=None, axes_handle=None):
     import numpy as np

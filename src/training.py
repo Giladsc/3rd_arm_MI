@@ -15,7 +15,7 @@ import json
 # MNE library for EEG data analysis
 import mne
 from mne import Epochs,find_events
-from mne.decoding import Vectorizer
+from mne.decoding import CSP, Vectorizer
 from mne.io import concatenate_raws, read_raw_edf
 from mne.datasets import eegbci
 
@@ -73,7 +73,6 @@ from braindecode.training.scoring import trial_preds_from_window_preds
 from torch.optim import Adam
 from torch.utils.data import DataLoader
 import torch
-from .preprocessing import *
 
 #%%
 class ShallowFBCSPNetWrapper:
