@@ -424,4 +424,151 @@ def plot_average_confusion_fixed_cv(folds_conf_matrices_per_window, w_times, t_s
 
     return avg_matrix, labels
 
+
+def plot_accuracy_over_time_group(group_results, n_classes=2, figsize=(12, 5)):
+    """
+    Plot average accuracy over time windows across all subjects in group_results.
+
+    Parameters
+    ----------
+    group_results : list
+        List of dicts, each containing 'subject_name', 'scores_windows', 'w_times'.
+    n_classes : int
+        Number of classes (for chance level line). Default 2.
+    figsize : tuple
+        Figure size.
+    """
+    from scipy.stats import sem as scipy_sem
+
+    series_by_subject = []
+    w_times_list = []
+    subject_names = []
+
+    for entry in group_results:
+        scores = entry.get('scores_windows')
+        w_times = entry.get('w_times')
+        if scores is None or w_times is None:
+            continue
+
+        if isinstance(scores, list) and len(scores) > 0:
+            scores_arr = np.array(scores)
+            subject_mean_across_folds = np.mean(scores_arr, axis=0)
+        else:
+            subject_mean_across_folds = np.array(scores)
+
+        series_by_subject.append(subject_mean_across_folds)
+        w_times_list.append(w_times)
+        subject_names.append(entry['subject_name'])
+
+    if len(series_by_subject) == 0:
+        print("No subjects with scores_windows available.")
+        return
+
+    all_scores = np.vstack(series_by_subject)
+    w_times = w_times_list[0]
+
+    group_mean = np.mean(all_scores, axis=0)
+    group_sem = scipy_sem(all_scores, axis=0)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    ax.axvline(x=0, color='black', linestyle='--', linewidth=1.5, alpha=0.8, label='Onset (t=0)')
+    chance_level = 1.0 / n_classes
+    ax.axhline(y=chance_level, color='red', linestyle='--', linewidth=1.5, alpha=0.8, label=f'Chance ({chance_level:.2f})')
+
+    colors = plt.cm.viridis(np.linspace(0, 1, len(subject_names)))
+    for i, (subj_scores, subj_name) in enumerate(zip(all_scores, subject_names)):
+        ax.plot(w_times, subj_scores, color=colors[i], alpha=0.3, linewidth=1.5, label=subj_name)
+
+    ax.plot(w_times, group_mean, 'o-', color='black', linewidth=3, markersize=6, label='Group Mean')
+    ax.fill_between(w_times, group_mean - group_sem, group_mean + group_sem,
+                    color='gray', alpha=0.3, label='\u00b1SEM')
+
+    ax.set_xlabel('Time (s)', fontsize=11)
+    ax.set_ylabel('Accuracy', fontsize=11)
+    ax.set_ylim([0, 1])
+    ax.set_title(f'Group Windowed Accuracy Over Time (n={len(subject_names)} subjects)', fontsize=12)
+
+    if len(subject_names) > 5:
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
+    else:
+        ax.legend(loc='best')
+
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_average_confusion_fixed_cv_group(group_results, w_times, t_start, t_end, normalize=True, figsize=(8, 7)):
+    """
+    Average confusion matrices across all subjects and CV folds for a time range and plot.
+
+    Parameters
+    ----------
+    group_results : list
+        List of dicts, each containing 'folds_confusion_matrices_per_window'.
+    w_times : np.ndarray
+        Time (s) for each window.
+    t_start : float
+        Start of time range (seconds).
+    t_end : float
+        End of time range (seconds).
+    normalize : bool
+        If True, normalize rows to sum to 1.
+    figsize : tuple
+        Figure size.
+    """
+    mask = (w_times >= t_start) & (w_times <= t_end)
+    window_idxs = list(np.where(mask)[0])
+
+    if len(window_idxs) == 0:
+        raise ValueError(f"No windows found between {t_start}s and {t_end}s. "
+                         f"w_times range: [{w_times[0]:.2f}, {w_times[-1]:.2f}]")
+
+    all_matrices = []
+    all_labels = None
+
+    for entry in group_results:
+        folds_conf_matrices = entry.get('folds_confusion_matrices_per_window')
+        if not folds_conf_matrices:
+            continue
+
+        for fold_matrices in folds_conf_matrices:
+            for w_idx in window_idxs:
+                if w_idx < len(fold_matrices):
+                    cm, labels = fold_matrices[w_idx]
+                    all_matrices.append(np.array(cm, dtype=float))
+                    if all_labels is None:
+                        all_labels = labels
+
+    if len(all_matrices) == 0:
+        print("No confusion matrices found in group_results.")
+        return None
+
+    avg_matrix = np.mean(np.stack(all_matrices, axis=0), axis=0)
+
+    if normalize:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            row_sums = avg_matrix.sum(axis=1, keepdims=True)
+            row_sums[row_sums == 0] = 1.0
+            avg_matrix = avg_matrix / row_sums
+            avg_matrix = np.nan_to_num(avg_matrix, nan=0.0)
+
+    if all_labels is None:
+        all_labels = [str(i) for i in range(avg_matrix.shape[0])]
+
+    fig, ax = plt.subplots(figsize=figsize)
+    disp = ConfusionMatrixDisplay(confusion_matrix=avg_matrix, display_labels=all_labels)
+    disp.plot(cmap='Blues', ax=ax, values_format='.2f' if normalize else '.0f')
+    ax.grid(False)
+
+    time_start = np.round(w_times[window_idxs[0]], 2)
+    time_end = np.round(w_times[window_idxs[-1]], 2)
+    ax.set_title(f'Group Average Confusion Matrix ({time_start}\u2013{time_end}s)\n'
+                 f'({len(group_results)} subjects, averaged across folds)', fontsize=12)
+    plt.tight_layout()
+    plt.show()
+
+    return avg_matrix, all_labels
+
 # %%
