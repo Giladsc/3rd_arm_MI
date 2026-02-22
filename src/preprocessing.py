@@ -670,7 +670,7 @@ def EEG_Preprocessing (current_path,raw, params_dict, pick_channels=True):
             filter_bank_epochs.append(epochs)
         
     
-    epochs = mne.Epochs(Raw_Filtered, events_from_annot, preload = True,baseline= [-2.5,-0.5], tmin=tmin, tmax=tmax, event_id=events_trigger_dict,detrend=0)
+    epochs = mne.Epochs(Raw_Filtered, events_from_annot, preload = True,baseline= None, tmin=tmin, tmax=tmax, event_id=events_trigger_dict,detrend=0)
     
     # If we want to perform auto rejection of epochs (time expensive)
     #ar = AutoReject()
