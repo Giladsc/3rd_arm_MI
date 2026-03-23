@@ -65,6 +65,51 @@ import matplotlib.pyplot as plt
 import pickle
 
 import copy
+from sklearn.base import BaseEstimator, TransformerMixin
+
+
+class PairwiseCSP(BaseEstimator, TransformerMixin):
+    """One-vs-One CSP: fits a separate CSP for every pair of classes,
+    then concatenates their log-variance features.
+
+    Parameters
+    ----------
+    n_components : int
+        Number of CSP components *per class pair*.
+    reg : str | None
+        Covariance regularization passed to each MNE CSP instance.
+    log : bool
+        Whether to apply log-variance transformation.
+    norm_trace : bool
+        Whether to normalise the covariance trace.
+    """
+
+    def __init__(self, n_components=4, reg='oas', log=True, norm_trace=True):
+        self.n_components = n_components
+        self.reg = reg
+        self.log = log
+        self.norm_trace = norm_trace
+
+    def fit(self, X, y):
+        self.classes_ = np.unique(y)
+        self.pairs_ = list(itertools.combinations(self.classes_, 2))
+        self.csps_ = []
+
+        for c1, c2 in self.pairs_:
+            mask = np.isin(y, [c1, c2])
+            csp = CSP(
+                n_components=self.n_components,
+                reg=self.reg,
+                log=self.log,
+                norm_trace=self.norm_trace,
+            )
+            csp.fit(X[mask], y[mask])
+            self.csps_.append(csp)
+        return self
+
+    def transform(self, X):
+        features = [csp.transform(X) for csp in self.csps_]
+        return np.hstack(features)
 
 
 from braindecode.models import ShallowFBCSPNet
@@ -207,6 +252,14 @@ def classifier_training(fold_train_data_x,fold_train_data_y,params_dict, BinaryC
             ('cov', Covariances(estimator="oas")),
             ('fgmdm', FgMDM(metric='riemann', tsupdate=False, n_jobs=1))
         ])
+    elif curr_classifier_name=='csp_ovo+lda':
+        pairwise_csp = PairwiseCSP(n_components=params_dict['n_components'], reg='oas', log=True, norm_trace=True)
+        scaler = StandardScaler()
+        lda = LinearDiscriminantAnalysis()
+        clf = Pipeline([('pairwise_csp', pairwise_csp), ('scaler', scaler), ('classifier_LDA', lda)])
+    elif curr_classifier_name=='csp_ovo+svm':
+        pairwise_csp = PairwiseCSP(n_components=params_dict['n_components'], reg=None, log=True, norm_trace=False)
+        clf = Pipeline([('pairwise_csp', pairwise_csp), ('ovo_svm', OneVsOneClassifier(SVC(kernel='linear', random_state=42)))])
     elif curr_classifier_name=='fbcsp+lda':
         #define the classifier components: 
         lda = LinearDiscriminantAnalysis()
@@ -235,6 +288,67 @@ def classifier_training(fold_train_data_x,fold_train_data_y,params_dict, BinaryC
         clf.fit(fold_train_data_x, fold_train_data_y_labels)
     # running classifier: test classifier on sliding window
     return clf,csp,lda
+
+def compute_block_weights(block_epoch_counts, alpha=0.7):
+    """Compute per-trial sample weights with exponential decay over blocks.
+
+    More recent blocks receive higher weight. Weights are normalised so that
+    the mean weight equals 1.0 (preserves the effective sample size signal).
+
+    Parameters
+    ----------
+    block_epoch_counts : list of int
+        Number of trials in each block, in chronological order.
+        e.g. [20, 18, 22] for 3 blocks.
+    alpha : float in (0, 1)
+        Decay factor. Older blocks are weighted by alpha^k where k is the
+        number of blocks ago. alpha=1.0 means equal weights (no decay).
+
+    Returns
+    -------
+    sample_weight : np.ndarray, shape (sum(block_epoch_counts),)
+    """
+    n_blocks = len(block_epoch_counts)
+    weights = []
+    for k, n_trials in enumerate(block_epoch_counts):
+        block_age = n_blocks - 1 - k
+        w = alpha ** block_age
+        weights.extend([w] * n_trials)
+    sample_weight = np.array(weights, dtype=float)
+    sample_weight /= sample_weight.mean()
+    return sample_weight
+
+
+def resample_by_weights(X, y, sample_weight, random_state=42):
+    """Resample a dataset by duplicating trials proportional to their weights.
+
+    Model-agnostic alternative to sample_weight — works with any estimator.
+    Total dataset size is preserved.
+
+    Parameters
+    ----------
+    X : np.ndarray, shape (n_trials, ...)
+    y : np.ndarray, shape (n_trials,)
+    sample_weight : np.ndarray, shape (n_trials,)
+    random_state : int
+
+    Returns
+    -------
+    X_resampled, y_resampled : np.ndarray
+    """
+    rng = np.random.default_rng(random_state)
+    n = len(y)
+    norm_weights = sample_weight / sample_weight.sum() * n
+    counts = np.floor(norm_weights).astype(int)
+    remainder = n - counts.sum()
+    if remainder > 0:
+        fractions = norm_weights - counts
+        top = np.argsort(fractions)[-remainder:]
+        counts[top] += 1
+    indices = np.repeat(np.arange(n), counts)
+    rng.shuffle(indices)
+    return X[indices], y[indices]
+
 
 def assert_same_label_space(y, classes):
     diff = np.setdiff1d(np.unique(y), classes)
