@@ -132,7 +132,7 @@ def compare_events(actual_events, predicted_events):
     }
 
 
-def compare_events_without_rest(actual_events, predicted_events, rest_label='Rest'):
+def compare_events_without_rest(actual_events, predicted_events, rest_label='FixatedRest'):
     """Compare actual vs predicted events, excluding *rest_label* epochs from accuracy.
 
     Parameters
@@ -461,11 +461,16 @@ def plot_binary_precision_recall_curve(train_inds, validation_inds, params_dict,
     return results_df
 
 def plot_confusion_matrix(conf_mat, class_labels, title="Confusion Matrix"):
-    plt.figure(figsize=(6,5))
-    sns.heatmap(conf_mat, annot=True, fmt='d', cmap='Blues', xticklabels=class_labels, yticklabels=class_labels)
-    plt.xlabel("Predicted Labels")
-    plt.ylabel("True Labels")
-    plt.title(title)
+    conf_mat = np.array(conf_mat, dtype=float)
+    np.nan_to_num(conf_mat, copy=False)
+    is_float = np.any(conf_mat != conf_mat.astype(int))
+    fmt = '.2f' if is_float else 'd'
+    fig, ax = plt.subplots(figsize=(6, 5))
+    disp = ConfusionMatrixDisplay(confusion_matrix=conf_mat, display_labels=class_labels)
+    disp.plot(cmap='Blues', ax=ax, values_format=fmt)
+    ax.set_title(title)
+    plt.grid(False)
+    plt.tight_layout()
     plt.show()
 
 
@@ -666,5 +671,132 @@ def plot_average_confusion_fixed_cv_group(group_results, w_times, t_start, t_end
     plt.show()
 
     return avg_matrix, all_labels
+
+
+def plot_permutation_test_confusion(fold_confusion_matrices, normalize=True, axes_handle=None):
+    """
+    Plot the average confusion matrix from the true run of run_permutation_test.
+
+    Works with confusion matrices returned by either scoring method:
+    - majority_vote: fold_confusion_matrices is list of (cm, classes)
+    - windowed_mean: fold_confusion_matrices is list of lists of (cm, classes) per window;
+      the matrix is averaged across folds and all windows.
+
+    Parameters
+    ----------
+    fold_confusion_matrices : list
+        The 4th return value of run_permutation_test.
+    normalize : bool
+        Row-normalize the averaged matrix. Default True.
+    axes_handle : Axes or None
+
+    Returns
+    -------
+    avg_matrix : np.ndarray
+    all_labels : list of str
+    """
+    # Detect format: flat list of (cm, classes) vs nested list of lists
+    if isinstance(fold_confusion_matrices[0], (list, tuple)) and isinstance(fold_confusion_matrices[0][0], np.ndarray):
+        # majority_vote format: [(cm, classes), ...]
+        cms = [cm for cm, _ in fold_confusion_matrices]
+        all_labels = list(fold_confusion_matrices[0][1])
+    else:
+        # windowed_mean format: list of lists of (cm, classes)
+        cms = []
+        all_labels = None
+        for fold in fold_confusion_matrices:
+            for cm, classes in fold:
+                cms.append(cm)
+                if all_labels is None:
+                    all_labels = list(classes)
+
+    avg_matrix = np.mean(np.stack(cms, axis=0), axis=0)
+
+    if normalize:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            row_sums = avg_matrix.sum(axis=1, keepdims=True)
+            row_sums[row_sums == 0] = 1.0
+            avg_matrix = avg_matrix / row_sums
+            avg_matrix = np.nan_to_num(avg_matrix, nan=0.0)
+
+    if axes_handle is None:
+        fig, ax = plt.subplots(figsize=(5, 4))
+    else:
+        ax = axes_handle
+        fig = ax.get_figure()
+
+    disp = ConfusionMatrixDisplay(confusion_matrix=avg_matrix, display_labels=all_labels)
+    disp.plot(cmap='Blues', ax=ax, values_format='.2f' if normalize else '.0f')
+    ax.grid(False)
+    ax.set_title('Permutation Test — True Classifier\nAverage Confusion Matrix', fontsize=11)
+    plt.tight_layout()
+    plt.show()
+    return avg_matrix, all_labels
+
+
+def plot_permutation_test(
+    true_score,
+    perm_scores,
+    p_value,
+    params_dict=None,
+    axes_handle=None,
+    score_tmin=None,
+    score_tmax=None,
+):
+    """
+    Plot the permutation test null distribution as a histogram.
+
+    Parameters
+    ----------
+    true_score : float          Real classifier accuracy (from run_permutation_test).
+    perm_scores : np.ndarray    Null distribution accuracies.
+    p_value : float             Pre-computed p-value.
+    params_dict : dict or None  If provided, reads 'desired_events' for chance level.
+    axes_handle : Axes or None  Existing axes; creates new figure if None.
+    score_tmin : float or None  For axis label only.
+    score_tmax : float or None  For axis label only.
+
+    Returns
+    -------
+    fig, ax
+    """
+    if axes_handle is None:
+        fig, ax = plt.subplots(figsize=(8, 5))
+    else:
+        ax = axes_handle
+        fig = ax.get_figure()
+
+    n_perm = len(perm_scores)
+    ax.hist(perm_scores, bins=max(10, n_perm // 10), color='steelblue',
+            edgecolor='white', alpha=0.8, label='Null distribution')
+    ax.axvline(true_score, color='crimson', linewidth=2.5, linestyle='--',
+               label=f'True score: {true_score:.3f}')
+
+    if params_dict is not None:
+        n_classes = len(params_dict.get('desired_events', []))
+        if n_classes > 0:
+            chance = 1.0 / n_classes
+            ax.axvline(chance, color='gray', linewidth=1.5, linestyle=':',
+                       label=f'Chance ({chance:.2f})')
+
+    ax.text(0.97, 0.95,
+            f'p = {p_value:.3f}  (n={n_perm})',
+            transform=ax.transAxes, ha='right', va='top', fontsize=11,
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
+
+    time_label = ''
+    if score_tmin is not None or score_tmax is not None:
+        lo = f'{score_tmin:.1f}s' if score_tmin is not None else 'start'
+        hi = f'{score_tmax:.1f}s' if score_tmax is not None else 'end'
+        time_label = f' ({lo}–{hi})'
+
+    ax.set_xlabel(f'Mean accuracy{time_label}', fontsize=11)
+    ax.set_ylabel('Count', fontsize=11)
+    ax.set_title('Permutation Test: Null Distribution vs True Classifier Accuracy', fontsize=12)
+    ax.legend(loc='upper left')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+    return fig, ax
 
 # %%

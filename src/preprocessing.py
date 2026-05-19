@@ -322,7 +322,10 @@ def get_subject_bad_electrodes(subject):
                     'DD' : {'Cz','CP5','FC2','T7','P4','Iz','FT8','P5','FT10', 'TP10'},
                     'JE' : {'T7','TP9','Iz','TP7','FT7','CP5','CP1'},
                     'NC' : {'CP5', 'AF8','AF7','Iz'},
-                    'Tomer' : {'FC5','CP1','F4','TP9','FT8','P5'}
+                    'EA' : {'Fp1', 'P4','T7','FT9','FT10','TP9','TP10','T8'},
+                    'SK' : {'Iz','T7','O1','O2','Oz','FT10','TP9','TP10','T8'},
+                    'Tomer' : {'FC5','CP1','F4','TP9','FT8','P5'},
+                    'NS' : {'T7','T8'}
                 }
     if subject in bad_elecs_dict.keys():
         subject_bad_electrodes=bad_elecs_dict[subject]
