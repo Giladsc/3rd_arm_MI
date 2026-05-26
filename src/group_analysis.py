@@ -86,11 +86,44 @@ def _save_subject_metrics(entry, save_dir):
         ]
     if isinstance(e.get('w_times'), np.ndarray):
         e['w_times'] = e['w_times'].tolist()
-    e['folds_confusion_matrices_per_window'] = None
+    e['folds_confusion_matrices_per_window'] = _serialize_confusion_matrices(
+        e.get('folds_confusion_matrices_per_window')
+    )
 
     with open(filepath, 'w') as f:
         json.dump(e, f, indent=2)
     print(f"  Saved metrics to {filepath}")
+
+
+def _serialize_confusion_matrices(folds_confusion_matrices_per_window):
+    """Convert nested (cm, labels) structure to a JSON-serializable list of lists of dicts."""
+    if folds_confusion_matrices_per_window is None:
+        return None
+    result = []
+    for fold in folds_confusion_matrices_per_window:
+        fold_result = []
+        for cm, labels in fold:
+            fold_result.append({
+                'cm': cm.tolist() if isinstance(cm, np.ndarray) else cm,
+                'labels': labels.tolist() if isinstance(labels, np.ndarray) else list(labels),
+            })
+        result.append(fold_result)
+    return result
+
+
+def _deserialize_confusion_matrices(data):
+    """Reconstruct (cm, labels) tuples with numpy arrays from the serialized format."""
+    if data is None:
+        return None
+    result = []
+    for fold in data:
+        fold_result = []
+        for item in fold:
+            cm = np.array(item['cm'])
+            labels = np.array(item['labels'])
+            fold_result.append((cm, labels))
+        result.append(fold_result)
+    return result
 
 
 def _get_classes_initials(desired_events):
@@ -170,8 +203,9 @@ def save_group_results(group_results, filepath_or_dir=None, filename=None):
             ]
         if isinstance(e.get('w_times'), np.ndarray):
             e['w_times'] = e['w_times'].tolist()
-        # Confusion matrices can't be serialized to JSON
-        e['folds_confusion_matrices_per_window'] = None
+        e['folds_confusion_matrices_per_window'] = _serialize_confusion_matrices(
+            e.get('folds_confusion_matrices_per_window')
+        )
         serializable.append(e)
 
     with open(filepath, 'w') as f:
@@ -190,6 +224,9 @@ def load_group_results(filepath):
             entry['scores_windows'] = np.array(entry['scores_windows'])
         if entry.get('w_times') is not None:
             entry['w_times'] = np.array(entry['w_times'])
+        entry['folds_confusion_matrices_per_window'] = _deserialize_confusion_matrices(
+            entry.get('folds_confusion_matrices_per_window')
+        )
 
     print(f"Loaded {len(data)} subjects from {filepath}")
     return data

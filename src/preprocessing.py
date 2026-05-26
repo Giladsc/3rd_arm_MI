@@ -302,7 +302,40 @@ def filter_events_by_rating(raw, movement_events, rating_prefix="Rating-", ratin
         raw.set_annotations(mne.Annotations([], [], []))  # If empty
 
     return raw
+#%%
+def fix_channel_names(raw):
+    """Fix swapped/misassigned channel labels in the EEG montage."""
+    
+    # Step 1: move all affected channels to temporary names
+    raw.rename_channels({
+        'F8':   '_tmp_F8',   'F4':   '_tmp_F4',
+        'FC2':  '_tmp_FC2',  'FT10': '_tmp_FT10',
+        'Cz':   '_tmp_Cz',   'T8':   '_tmp_T8',
+        'CP2':  '_tmp_CP2',  'CP6':  '_tmp_CP6',
+        'P4':   '_tmp_P4',   'TP10': '_tmp_TP10',
+        'P7':   '_tmp_P7',   'P3':   '_tmp_P3',
+        'Pz':   '_tmp_Pz',   'CP1':  '_tmp_CP1',
+        'CP5':  '_tmp_CP5',  'TP9':  '_tmp_TP9',
+    })
 
+    # Step 2: rename temps to their final destinations
+    raw.rename_channels({
+        # swaps
+        '_tmp_F8':   'F4',   '_tmp_F4':   'F8',
+        '_tmp_FC2':  'FT10', '_tmp_FT10': 'FC2',
+        '_tmp_Cz':   'T8',   '_tmp_T8':   'Cz',
+        '_tmp_CP2':  'CP6',  '_tmp_CP6':  'CP2',
+        '_tmp_P4':   'TP10', '_tmp_TP10': 'P4',
+        # cycle: P7→P3→Pz→CP1→CP5→TP9→P7
+        '_tmp_P7':  'P3',
+        '_tmp_P3':  'Pz',
+        '_tmp_Pz':  'CP1',
+        '_tmp_CP1': 'CP5',
+        '_tmp_CP5': 'TP9',
+        '_tmp_TP9': 'P7',
+    })
+
+    return raw
 #%%
 def get_subject_bad_electrodes(subject):
     elecs_to_drop={}
@@ -320,12 +353,13 @@ def get_subject_bad_electrodes(subject):
                     'GiladRSL' : {'C5','FC4','CP5','T7','FT9','FT10','TP9','TP10','T8'},
                     'NoamV' : {'Iz', 'T7','O1','O2','Oz'},
                     'DD' : {'Cz','CP5','FC2','T7','P4','Iz','FT8','P5','FT10', 'TP10'},
-                    'JE' : {'T7','TP9','Iz','TP7','FT7','CP5','CP1'},
-                    'NC' : {'CP5', 'AF8','AF7','Iz'},
+                    'JE' : {'T7','TP9','Iz','TP7','FT7'},
+                    'NC' : {'TP9', 'AF8','AF7','Iz'},
                     'EA' : {'Fp1', 'P4','T7','FT9','FT10','TP9','TP10','T8'},
                     'SK' : {'Iz','T7','O1','O2','Oz','FT10','TP9','TP10','T8'},
                     'Tomer' : {'FC5','CP1','F4','TP9','FT8','P5'},
-                    'NS' : {'T7','T8'}
+                    'NS' : {'T7','TP10'},
+                    'ID' : {'TP9','TP7'}
                 }
     if subject in bad_elecs_dict.keys():
         subject_bad_electrodes=bad_elecs_dict[subject]
