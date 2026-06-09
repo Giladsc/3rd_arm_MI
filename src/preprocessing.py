@@ -76,7 +76,7 @@ import torch
 
 
 #%%
-standard_event_id = {'FixatedRest': 1,'ActiveRest': 11, 'OpenPalm': 2, 'ClosePalm':33, 'Rating': 4,'Rest': 55,'Long Break': 6,'RightHand' : 7, 'LeftHand' : 8, 'Idle': 0, 'Right': 77,'Left': 88}
+standard_event_id = {'FixatedRest': 1,'ActiveRest': 11, 'OpenPalm': 2, 'MiddleHand':33, 'Rating': 4,'Rest': 55,'Long Break': 6,'RightHand' : 7, 'LeftHand' : 8, 'Idle': 0, 'Right': 77,'Left': 88}
 
 def remap_epoch_events_to_standard(epochs, standard_event_id, desired_events):
     """
@@ -359,7 +359,8 @@ def get_subject_bad_electrodes(subject):
                     'SK' : {'Iz','T7','O1','O2','Oz','FT10','TP9','TP10','T8'},
                     'Tomer' : {'FC5','CP1','F4','TP9','FT8','P5'},
                     'NS' : {'T7','TP10'},
-                    'ID' : {'TP9','TP7'}
+                    'ID' : {'TP9','TP7'},
+                    'LD' : {'TP10','FT8'}
                 }
     if subject in bad_elecs_dict.keys():
         subject_bad_electrodes=bad_elecs_dict[subject]

@@ -884,3 +884,170 @@ def run_full_epoch_classification_cv(epochs, epochs_cropped, cv_split, params_di
         fold_confusion_matrices.append((cm, classes))
 
     return fold_accuracies, fold_confusion_matrices
+
+
+def run_trial_count_sweep_cv(epochs, epochs_cropped, cv_split, params_dict,
+                              n_trials_list=None,
+                              n_repeats=5,
+                              tmin=0.0, tmax=5.0,
+                              BinaryClassification=False,
+                              labels_override=None):
+    """
+    Learning curve sweep: vary the number of training trials and measure accuracy.
+
+    For each value in n_trials_list, draws n_repeats stratified subsamples of that
+    size from each CV fold's training set, trains the classifier, and evaluates on
+    the same held-out test fold.  Averaging across folds and repeats yields a
+    robust accuracy-vs-n_trials learning curve.
+
+    The test set is held constant across all trial counts within each fold so that
+    accuracy comparisons are apples-to-apples.
+
+    Parameters
+    ----------
+    epochs : mne.Epochs
+        UNCROPPED epochs used for test evaluation.
+    epochs_cropped : mne.Epochs
+        CROPPED epochs used for training / augmentation.
+    cv_split : iterable of (train_idx, test_idx)
+        Must be materialise-able (iterated multiple times internally).
+    params_dict : dict
+        Same structure as run_full_epoch_classification_cv.
+    n_trials_list : list of int or None
+        Trial counts to sweep over.  Defaults to [5, 10, 20, 30, 50, 80, 120].
+    n_repeats : int
+        Random draws per (fold, n_trials) pair.  Ignored when n_trials covers all
+        available training data (no randomness).
+    tmin, tmax : float
+        Epoch range (seconds relative to event onset) for majority-vote evaluation.
+    BinaryClassification : bool
+
+    Returns
+    -------
+    sweep_results : dict
+        Keyed by n_trials (int):
+        {
+          n_trials: {
+            'all_accs': list[float],   # one entry per (fold x repeat)
+            'mean_acc': float,
+            'std_acc':  float,
+            'sem_acc':  float,
+          }
+        }
+    """
+    from .preprocessing import augment_data
+    from scipy.stats import sem as scipy_sem
+
+    if n_trials_list is None:
+        n_trials_list = [5, 10, 20, 30, 50, 80, 120]
+
+    augmentation_params = params_dict['augmentation_params']
+    windowed_prediction_params = params_dict['windowed_prediction_params']
+    win_len = float(windowed_prediction_params['win_len'])
+    win_step = float(windowed_prediction_params['win_step'])
+
+    sfreq = epochs.info['sfreq']
+    epoch_tmin = params_dict['epoch_tmin']
+
+    epochs_data = epochs.get_data()
+    epochs_cropped_data = epochs_cropped.get_data()
+
+    assert epochs.events.shape[0] == epochs_cropped.events.shape[0], "Epoch count mismatch"
+    assert np.all(epochs.events[:, -1] == epochs_cropped.events[:, -1]), "Label mismatch"
+
+    w_length = int(round(sfreq * win_len))
+    w_step_samp = int(round(sfreq * win_step))
+
+    start_sample = max(0, int(round((tmin - epoch_tmin) * sfreq)))
+    end_sample = min(epochs_data.shape[2], int(round((tmax - epoch_tmin) * sfreq)))
+    w_start_eval = np.arange(start_sample, end_sample - w_length + 1, w_step_samp)
+
+    if len(w_start_eval) == 0:
+        raise ValueError(
+            f"No windows fit in [{tmin}, {tmax}]s with win_len={win_len}s."
+        )
+
+    triggers_label_dict = {val: key for key, val in params_dict['events_trigger_dict'].items()}
+    n_classes = len(params_dict['desired_events'])
+
+    sweep_results = {n: {'all_accs': []} for n in n_trials_list}
+
+    cv_list = list(cv_split)
+
+    for fold_i, (train_idx, test_idx) in enumerate(cv_list):
+        _labels = labels_override if labels_override is not None else epochs_cropped.events[:, -1]
+        y_train_full = _labels[train_idx]
+        y_test = _labels[test_idx]
+
+        x_test = epochs_data[test_idx]
+        y_test_labels = np.array([triggers_label_dict[c] for c in y_test])
+        if BinaryClassification:
+            A, B, C = 'RightHand', 'LeftHand', 'ClosePalm'
+            y_test_labels = np.array(
+                ['motor_imagery' if lbl in [A, B, C] else lbl for lbl in y_test_labels]
+            )
+
+        n_train_available = len(train_idx)
+
+        for n_trials in n_trials_list:
+            if n_trials < n_classes:
+                # Cannot form a stratified sample with fewer trials than classes
+                continue
+
+            if n_trials >= n_train_available:
+                # Use all available training data; repeats are identical so run once
+                subsample_indices_list = [np.arange(n_train_available)]
+            else:
+                # Generate n_repeats independent stratified subsamples
+                subsample_indices_list = []
+                for rep_seed in range(n_repeats):
+                    sss = StratifiedShuffleSplit(n_splits=1, train_size=n_trials,
+                                                 random_state=rep_seed)
+                    sub_idx, _ = next(sss.split(np.zeros(n_train_available), y_train_full))
+                    subsample_indices_list.append(sub_idx)
+
+            for sub_idx in subsample_indices_list:
+                x_sub = epochs_cropped_data[train_idx[sub_idx]]
+                y_sub = y_train_full[sub_idx]
+
+                augmented_x, augmented_y = augment_data(augmentation_params, x_sub, y_sub, sfreq)
+
+                try:
+                    clf, _, _ = classifier_training(augmented_x, augmented_y, params_dict,
+                                                    BinaryClassification=BinaryClassification)
+                except Exception as e:
+                    print(f"  Fold {fold_i + 1}, n_trials={n_trials}: training failed ({e}), skipping")
+                    continue
+
+                classes = np.array(clf.classes_)
+                assert_same_label_space(y_test_labels, classes)
+
+                all_window_preds = []
+                for n in w_start_eval:
+                    window_data = _slice_window_block(x_test, n, w_length)
+                    all_window_preds.append(clf.predict(window_data))
+
+                all_window_preds = np.array(all_window_preds).T  # (n_test_trials, n_windows)
+                trial_preds = np.array([
+                    vals[np.argmax(counts)]
+                    for vals, counts in (np.unique(row, return_counts=True) for row in all_window_preds)
+                ])
+
+                fold_acc = float(np.mean(trial_preds == y_test_labels))
+                sweep_results[n_trials]['all_accs'].append(fold_acc)
+
+        print(f"Fold {fold_i + 1}/{len(cv_list)} complete.")
+
+    # Aggregate statistics across all folds and repeats
+    for n_trials in n_trials_list:
+        accs = sweep_results[n_trials]['all_accs']
+        if len(accs) > 0:
+            sweep_results[n_trials]['mean_acc'] = float(np.mean(accs))
+            sweep_results[n_trials]['std_acc'] = float(np.std(accs))
+            sweep_results[n_trials]['sem_acc'] = float(scipy_sem(accs))
+        else:
+            sweep_results[n_trials]['mean_acc'] = float('nan')
+            sweep_results[n_trials]['std_acc'] = float('nan')
+            sweep_results[n_trials]['sem_acc'] = float('nan')
+
+    return sweep_results

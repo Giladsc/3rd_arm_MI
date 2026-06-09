@@ -947,3 +947,92 @@ def plot_average_confusion_full_epoch_group(group_results_full_epoch,
     plt.show()
 
     return avg_matrix, all_labels
+
+
+def plot_trial_count_sweep(sweep_results, n_classes=None, title=None, save_path=None):
+    """
+    Visualise the output of run_trial_count_sweep_cv() as a two-panel figure.
+
+    Panel 1 — Learning curve: mean accuracy ± SEM vs. number of training trials.
+    Panel 2 — Marginal gain: accuracy improvement per additional 10 trials, useful
+               for identifying the "knee" where more data gives diminishing returns.
+
+    Parameters
+    ----------
+    sweep_results : dict
+        Output of run_trial_count_sweep_cv().
+        Keys are n_trials (int); values contain 'mean_acc', 'sem_acc', 'all_accs'.
+    n_classes : int or None
+        Number of classes, used to draw the chance level line (1/n_classes).
+        If None, no chance line is drawn.
+    title : str or None
+        Optional suptitle for the figure.
+    save_path : str or None
+        If provided, saves the figure to this path before showing.
+    """
+    from scipy.stats import sem as scipy_sem
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # Sort by trial count; skip any n_trials entries with no valid data
+    n_trials_sorted = sorted(k for k in sweep_results if not np.isnan(sweep_results[k]['mean_acc']))
+    mean_accs = np.array([sweep_results[n]['mean_acc'] for n in n_trials_sorted])
+    sem_accs = np.array([sweep_results[n]['sem_acc'] for n in n_trials_sorted])
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    # ── Panel 1: Learning curve ──────────────────────────────────────────────
+    ax = axes[0]
+    ax.plot(n_trials_sorted, mean_accs, color='#708090', marker='o', linewidth=2,
+            label='Mean Accuracy')
+    ax.fill_between(n_trials_sorted,
+                    mean_accs - sem_accs,
+                    mean_accs + sem_accs,
+                    alpha=0.3, color='#008080', label='±1 SEM')
+
+    if n_classes is not None:
+        chance = 1.0 / n_classes
+        ax.axhline(chance, linestyle='-.', color='gray',
+                   label=f'Chance ({chance:.2f})')
+
+    ax.set_xlabel('Number of Training Trials', fontsize=12)
+    ax.set_ylabel('Classification Accuracy', fontsize=12)
+    ax.set_title('Learning Curve: Accuracy vs. Training Trials', fontsize=12)
+    ax.set_ylim([0, 1])
+    ax.set_xticks(n_trials_sorted)
+    ax.legend(loc='lower right')
+    ax.grid(True, alpha=0.4)
+
+    # ── Panel 2: Marginal gain ───────────────────────────────────────────────
+    ax2 = axes[1]
+    if len(n_trials_sorted) >= 2:
+        delta_acc = np.diff(mean_accs)
+        delta_trials = np.diff(n_trials_sorted)
+        # Marginal gain per 10 additional trials
+        marginal_gain = (delta_acc / delta_trials) * 10
+        midpoints = [(n_trials_sorted[i] + n_trials_sorted[i + 1]) / 2
+                     for i in range(len(n_trials_sorted) - 1)]
+
+        bar_widths = [dt * 0.6 for dt in delta_trials]
+        bar_colors = ['#2ca02c' if g > 0 else '#d62728' for g in marginal_gain]
+        ax2.bar(midpoints, marginal_gain, width=bar_widths, color=bar_colors, alpha=0.7)
+        ax2.axhline(0, color='k', linewidth=0.8)
+        ax2.set_xlabel('Training Trials (midpoint of interval)', fontsize=12)
+        ax2.set_ylabel('Accuracy Gain per 10 Trials', fontsize=12)
+        ax2.set_title('Marginal Accuracy Gain (Diminishing Returns)', fontsize=12)
+        ax2.set_xticks([int(m) for m in midpoints])
+        ax2.grid(True, alpha=0.4, axis='y')
+    else:
+        ax2.text(0.5, 0.5, 'Need ≥ 2 trial counts for marginal gain plot',
+                 ha='center', va='center', transform=ax2.transAxes)
+
+    if title:
+        fig.suptitle(title, fontsize=14, y=1.01)
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight', dpi=150)
+
+    plt.show()
+    return fig, axes
