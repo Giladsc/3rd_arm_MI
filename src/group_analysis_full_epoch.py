@@ -197,6 +197,121 @@ def save_group_results_full_epoch(group_results_full_epoch,
     return filepath
 
 
+def descriptive_stats_full_epoch(group_results_full_epoch, n_classes=None, chance_level=None):
+    """
+    Compute and print descriptive statistics for full-epoch group results.
+
+    Columns
+    -------
+    W-Std  : within-subject std (fold-to-fold variability) — same scale for all rows.
+    B-Std  : between-subject std (std of subject means) — GROUP row only; used for
+             the group-level SEM and CI.
+
+    Parameters
+    ----------
+    group_results_full_epoch : list
+        Built with add_subject_to_group_full_epoch.
+    n_classes : int, optional
+        Number of classes — used to compute chance level (1/n_classes).
+        Ignored if chance_level is provided.
+    chance_level : float, optional
+        Override for chance level (e.g. 0.25 for 4 classes).
+
+    Returns
+    -------
+    stats : dict
+        'per_subject' : list of dicts with subject-level stats
+        'group'       : dict with grand mean, between_std, within_std_mean,
+                        sem, ci95, median, min, max, above_chance
+        'chance'      : chance level used (or None)
+    """
+    if not group_results_full_epoch:
+        raise ValueError("group_results_full_epoch is empty.")
+
+    if chance_level is None and n_classes is not None:
+        chance_level = 1.0 / n_classes
+
+    per_subject = []
+    subject_means = []
+    subject_within_stds = []
+
+    for entry in group_results_full_epoch:
+        accs = np.array(entry['fold_accuracies'], dtype=float)
+        n = len(accs)
+        mean       = float(np.mean(accs))
+        within_std = float(np.std(accs, ddof=1)) if n > 1 else float('nan')
+        se         = within_std / np.sqrt(n)      if n > 1 else float('nan')
+        ci95       = 1.96 * se                    if n > 1 else float('nan')
+        above      = float(mean - chance_level)   if chance_level is not None else float('nan')
+
+        per_subject.append({
+            'subject':     entry['subject_name'],
+            'n_folds':     n,
+            'mean':        mean,
+            'within_std':  within_std,
+            'sem':         se,
+            'ci95':        ci95,
+            'min':         float(np.min(accs)),
+            'max':         float(np.max(accs)),
+            'above_chance': above,
+        })
+        subject_means.append(mean)
+        subject_within_stds.append(within_std)
+
+    means = np.array(subject_means)
+    n_subs = len(means)
+
+    between_std  = float(np.std(means, ddof=1))                if n_subs > 1 else float('nan')
+    group_sem    = float(between_std / np.sqrt(n_subs))        if n_subs > 1 else float('nan')
+    within_mean  = float(np.nanmean(subject_within_stds))
+
+    group = {
+        'n_subjects':      n_subs,
+        'grand_mean':      float(np.mean(means)),
+        'between_std':     between_std,
+        'within_std_mean': within_mean,
+        'sem':             group_sem,
+        'ci95':            1.96 * group_sem if n_subs > 1 else float('nan'),
+        'median':          float(np.median(means)),
+        'min':             float(np.min(means)),
+        'max':             float(np.max(means)),
+        'above_chance':    float(np.mean(means) - chance_level) if chance_level is not None else float('nan'),
+    }
+
+    # --- Print table ---
+    header = (f"{'Subject':<10} {'N folds':>7} {'Mean':>7} {'W-Std':>7} "
+              f"{'B-Std':>7} {'SEM':>7} {'95% CI':>8} {'Min':>7} {'Max':>7}")
+    if chance_level is not None:
+        header += f" {'vs Chance':>10}"
+    print(header)
+    print('-' * len(header))
+
+    for s in per_subject:
+        row = (f"{s['subject']:<10} {s['n_folds']:>7d} {s['mean']:>7.3f} "
+               f"{s['within_std']:>7.3f} {'---':>7} "
+               f"{s['sem']:>7.3f} {s['ci95']:>8.3f} "
+               f"{s['min']:>7.3f} {s['max']:>7.3f}")
+        if chance_level is not None:
+            row += f" {s['above_chance']:>+10.3f}"
+        print(row)
+
+    print('-' * len(header))
+    g = group
+    row = (f"{'GROUP':<10} {g['n_subjects']:>7d} {g['grand_mean']:>7.3f} "
+           f"{g['within_std_mean']:>7.3f} {g['between_std']:>7.3f} "
+           f"{g['sem']:>7.3f} {g['ci95']:>8.3f} "
+           f"{g['min']:>7.3f} {g['max']:>7.3f}")
+    if chance_level is not None:
+        row += f" {g['above_chance']:>+10.3f}"
+    print(row)
+
+    if chance_level is not None:
+        print(f"\nChance level: {chance_level:.3f} ({'' if n_classes is None else str(n_classes) + ' classes'})")
+    print("W-Std = within-subject fold std  |  B-Std = between-subject std of means (used for SEM/CI)")
+
+    return {'per_subject': per_subject, 'group': group, 'chance': chance_level}
+
+
 def load_group_results_full_epoch(filepath):
     """
     Load full-epoch group results from JSON, restoring numpy arrays.

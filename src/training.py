@@ -886,6 +886,121 @@ def run_full_epoch_classification_cv(epochs, epochs_cropped, cv_split, params_di
     return fold_accuracies, fold_confusion_matrices
 
 
+def run_adaptive_cv(all_epochs, adaptive_block_epochs, cv_split, params_dict,
+                    alpha=0.7, tmin=0.0, tmax=5.0, BinaryClassification=False):
+    """
+    CV evaluation for the co-adaptive classifier with block-weighted training.
+
+    Replicates the block-weighted augment-and-resample training from the online
+    retraining cell inside a proper CV loop so each test fold is held out from
+    the weighted training set.
+
+    Parameters
+    ----------
+    all_epochs : mne.Epochs
+        Concatenation of all adaptive_block_epochs (same trial order, uncropped).
+    adaptive_block_epochs : list of mne.Epochs
+        One Epochs object per block, in chronological order.
+    cv_split : iterable of (train_idx, test_idx)
+    params_dict : dict
+        Must contain 'classifier_window_s', 'classifier_window_e',
+        'augmentation_params', 'windowed_prediction_params', 'epoch_tmin',
+        'events_trigger_dict'.
+    alpha : float
+        Exponential decay factor (same value used in the online retraining cell).
+    tmin, tmax : float
+        Epoch range (s, relative to event onset) for majority-vote evaluation.
+    BinaryClassification : bool
+
+    Returns
+    -------
+    fold_accuracies : list of float
+    fold_confusion_matrices : list of (cm, classes)
+        Same format as run_full_epoch_classification_cv — one entry per fold.
+    """
+    from .preprocessing import augment_data
+
+    block_counts = [len(e) for e in adaptive_block_epochs]
+    sample_weight_all = compute_block_weights(block_counts, alpha=alpha)
+
+    sfreq = all_epochs.info['sfreq']
+    epoch_tmin = params_dict['epoch_tmin']
+
+    epochs_data = all_epochs.get_data()
+    epochs_cropped_data = all_epochs.copy().crop(
+        tmin=params_dict['classifier_window_s'],
+        tmax=params_dict['classifier_window_e']
+    ).get_data()
+
+    labels = all_epochs.events[:, -1]
+    triggers_label_dict = {val: key for key, val in params_dict['events_trigger_dict'].items()}
+
+    win_len = float(params_dict['windowed_prediction_params']['win_len'])
+    win_step = float(params_dict['windowed_prediction_params']['win_step'])
+    w_length = int(round(sfreq * win_len))
+    w_step_samp = int(round(sfreq * win_step))
+
+    start_sample = max(0, int(round((tmin - epoch_tmin) * sfreq)))
+    end_sample = min(epochs_data.shape[2], int(round((tmax - epoch_tmin) * sfreq)))
+    w_start_eval = np.arange(start_sample, end_sample - w_length + 1, w_step_samp)
+
+    if len(w_start_eval) == 0:
+        raise ValueError(f"No windows fit in [{tmin}, {tmax}]s with win_len={win_len}s.")
+
+    fold_accuracies = []
+    fold_confusion_matrices = []
+
+    for train_idx, test_idx in cv_split:
+        y_train = labels[train_idx]
+        y_test = labels[test_idx]
+
+        x_train_source = epochs_cropped_data[train_idx]
+        train_weights = sample_weight_all[train_idx]
+
+        augmented_x, augmented_y = augment_data(
+            params_dict['augmentation_params'], x_train_source, y_train, sfreq
+        )
+
+        aug_factor = len(augmented_x) // len(x_train_source)
+        remainder = len(augmented_x) % len(x_train_source)
+        aug_weights = np.concatenate([
+            np.tile(train_weights, aug_factor),
+            train_weights[:remainder]
+        ])
+        aug_x_r, aug_y_r = resample_by_weights(augmented_x, augmented_y, aug_weights)
+
+        clf, _, _ = classifier_training(aug_x_r, aug_y_r, params_dict,
+                                        BinaryClassification=BinaryClassification)
+
+        x_test = epochs_data[test_idx]
+        y_test_labels = np.array([triggers_label_dict[c] for c in y_test])
+        if BinaryClassification:
+            A, B, C = 'RightHand', 'LeftHand', 'ClosePalm'
+            y_test_labels = np.array(['motor_imagery' if lbl in [A, B, C] else lbl
+                                      for lbl in y_test_labels])
+
+        classes = np.array(clf.classes_)
+        assert_same_label_space(y_test_labels, classes)
+
+        all_window_preds = []
+        for n in w_start_eval:
+            window_data = _slice_window_block(x_test, n, w_length)
+            all_window_preds.append(clf.predict(window_data))
+
+        all_window_preds = np.array(all_window_preds).T
+        trial_preds = np.array([
+            vals[np.argmax(counts)]
+            for vals, counts in (np.unique(row, return_counts=True) for row in all_window_preds)
+        ])
+
+        fold_acc = float(np.mean(trial_preds == y_test_labels))
+        cm = confusion_matrix(y_test_labels, trial_preds, labels=classes)
+        fold_accuracies.append(fold_acc)
+        fold_confusion_matrices.append((cm, classes))
+
+    return fold_accuracies, fold_confusion_matrices
+
+
 def run_trial_count_sweep_cv(epochs, epochs_cropped, cv_split, params_dict,
                               n_trials_list=None,
                               n_repeats=5,

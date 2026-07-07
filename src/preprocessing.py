@@ -76,7 +76,7 @@ import torch
 
 
 #%%
-standard_event_id = {'FixatedRest': 1,'ActiveRest': 11, 'OpenPalm': 2, 'MiddleHand':33, 'Rating': 4,'Rest': 55,'Long Break': 6,'RightHand' : 7, 'LeftHand' : 8, 'Idle': 0, 'Right': 77,'Left': 88}
+standard_event_id = {'FixatedRest': 1,'ActiveRest': 11, 'OpenPalm': 2,'ClosePalm': 3, 'MiddleHand':33, 'Rating': 4,'Rest': 55,'Long Break': 6,'RightHand' : 7, 'LeftHand' : 8, 'Idle': 0, 'Right': 77,'Left': 88}
 
 def remap_epoch_events_to_standard(epochs, standard_event_id, desired_events):
     """
