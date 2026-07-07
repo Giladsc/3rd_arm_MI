@@ -323,7 +323,22 @@ def resample_by_weights(X, y, sample_weight, random_state=42):
     """Resample a dataset by duplicating trials proportional to their weights.
 
     Model-agnostic alternative to sample_weight — works with any estimator.
-    Total dataset size is preserved.
+    Total dataset size is approximately preserved (exactly preserved when all
+    weights are equal).
+
+    Per-trial duplicate counts use stochastic rounding: floor(norm_weight)
+    copies, plus one more with probability equal to the fractional part.
+    This is unbiased (E[count] == norm_weight) and reduces to an exact,
+    deterministic 1-copy-each pass-through when weights are uniform.
+
+    NOTE: an earlier version of this function instead took floor(norm_weight)
+    copies and then deterministically topped up the exact remainder count by
+    giving one extra copy to the highest-fraction trials. For weights close to
+    1.0 (e.g. mean-normalised exponential block-decay weights with few
+    blocks), every count floored to 0 or 1 and that top-up step always ended
+    up handing back out exactly the deficit it created — silently collapsing
+    to "1 copy each" regardless of the actual weight values. Independent
+    per-trial stochastic rounding avoids that collapse.
 
     Parameters
     ----------
@@ -340,11 +355,8 @@ def resample_by_weights(X, y, sample_weight, random_state=42):
     n = len(y)
     norm_weights = sample_weight / sample_weight.sum() * n
     counts = np.floor(norm_weights).astype(int)
-    remainder = n - counts.sum()
-    if remainder > 0:
-        fractions = norm_weights - counts
-        top = np.argsort(fractions)[-remainder:]
-        counts[top] += 1
+    fractions = norm_weights - counts
+    counts = counts + (rng.random(n) < fractions).astype(int)
     indices = np.repeat(np.arange(n), counts)
     rng.shuffle(indices)
     return X[indices], y[indices]
