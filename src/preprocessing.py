@@ -78,6 +78,23 @@ import torch
 #%%
 standard_event_id = {'FixatedRest': 1,'ActiveRest': 11, 'OpenPalm': 2,'ClosePalm': 3, 'MiddleHand':33, 'Rating': 4,'Rest': 55,'Long Break': 6,'RightHand' : 7, 'LeftHand' : 8, 'Idle': 0, 'Right': 77,'Left': 88}
 
+# Old recordings label this event 'ClosePalm'; newer recordings (e.g. subject LD)
+# label it 'MiddleHand'. 'MiddleHand' is the canonical name going forward.
+EVENT_LABEL_ALIASES = {'ClosePalm': 'MiddleHand'}
+
+def standardize_event_labels(raw, label_aliases=None):
+    """Rename raw annotation descriptions per label_aliases (old -> new), in place.
+    Only renames aliases actually present in this recording's annotations, so it
+    is a guaranteed no-op for recordings that already use the canonical label
+    (mne.Annotations.rename raises if given a key that isn't present)."""
+    if label_aliases is None:
+        label_aliases = EVENT_LABEL_ALIASES
+    present_aliases = {old: new for old, new in label_aliases.items()
+                        if old in raw.annotations.description}
+    if present_aliases:
+        raw.annotations.rename(present_aliases)
+    return raw
+
 def remap_epoch_events_to_standard(epochs, standard_event_id, desired_events):
     """
     Remap event codes to standard_event_id, keep only desired events,
@@ -335,6 +352,15 @@ def fix_channel_names(raw):
         '_tmp_TP9': 'P7',
     })
 
+    return raw
+#%%
+SUBJECTS_REQUIRING_CHANNEL_RENAME = {'EA', 'AN', 'NZ', 'NS', 'SK', 'OT'}
+
+def fix_channel_names_for_subject(raw, subject):
+    """Apply fix_channel_names(raw) only for subjects whose recordings need the
+    swapped/misassigned channel-label correction. No-op for all other subjects."""
+    if subject in SUBJECTS_REQUIRING_CHANNEL_RENAME:
+        raw = fix_channel_names(raw)
     return raw
 #%%
 def get_subject_bad_electrodes(subject):

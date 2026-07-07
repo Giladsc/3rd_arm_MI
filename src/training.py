@@ -273,12 +273,12 @@ def classifier_training(fold_train_data_x,fold_train_data_y,params_dict, BinaryC
     #get string labels instead of numeric (so the classifier will have an informative clf.classes_ )
     triggers_label_dict={val:key for key,val in params_dict['events_trigger_dict'].items()} 
     fold_train_data_y_labels=np.array([triggers_label_dict[cur_y] for cur_y in fold_train_data_y])  
-    A, B , C = 'RightHand','LeftHand', 'ClosePalm'  # Replace with actual trigger names/values
+    A, B , C = 'RightHand','LeftHand', 'MiddleHand'  # Replace with actual trigger names/values
     combined_labels_train = np.array(['motor_imagery' if label in [A, B,C] else label for label in fold_train_data_y_labels])
     
     
     # Define class weights based on class distribution
-    class_weights = {'Rest': 2, 'ActiveRest': 6, 'OpenPalm': 6, 'ClosePalm': 6}
+    class_weights = {'Rest': 2, 'ActiveRest': 6, 'OpenPalm': 6, 'MiddleHand': 6}
 
     # Assign a sample weight to each sample based on its class
     #sample_weights = np.array([class_weights[cls] for cls in combined_labels_train])
@@ -630,7 +630,7 @@ def run_windowed_classification_on_fold(fold_train_data_x,fold_train_data_y,fold
     triggers_label_dict={val:key for key,val in params_dict['events_trigger_dict'].items()} 
     fold_test_data_y_labels=np.array([triggers_label_dict[cur_y] for cur_y in fold_test_data_y])
     if BinaryClassification:
-        A, B , C = 'RightHand','LeftHand', 'ClosePalm'  # Replace with actual trigger names/values
+        A, B , C = 'RightHand','LeftHand', 'MiddleHand'  # Replace with actual trigger names/values
         combined_labels_test = np.array(['motor_imagery' if label in [A, B, C] else label for label in fold_test_data_y_labels])
         fold_windowed_scores,confusion_matrices_per_window=run_windowed_pretrained_classifier(clf,fold_test_data_x_uncropped,combined_labels_test,w_start,w_length)
     else:
@@ -682,7 +682,7 @@ def sanity_check_trained_clf(trained_clf, epochs, params_dict, BinaryClassificat
     y_labels = np.array([triggers_label_dict[code] for code in epochs.events[:, -1]])
 
     if BinaryClassification:
-        A, B, C = 'RightHand', 'LeftHand', 'ClosePalm'
+        A, B, C = 'RightHand', 'LeftHand', 'MiddleHand'
         y_labels = np.array(['motor_imagery' if label in [A, B, C] else label for label in y_labels])
 
     scores_windows, confusion_matrices_per_window = run_windowed_pretrained_classifier(
@@ -758,7 +758,7 @@ def evaluate_full_epoch(clf, epochs, params_dict, tmin=0.0, tmax=5.0, BinaryClas
     triggers_label_dict = {val: key for key, val in params_dict['events_trigger_dict'].items()}
     y_labels = np.array([triggers_label_dict[code] for code in epochs.events[:, -1]])
     if BinaryClassification:
-        A, B, C = 'RightHand', 'LeftHand', 'ClosePalm'
+        A, B, C = 'RightHand', 'LeftHand', 'MiddleHand'
         y_labels = np.array(['motor_imagery' if lbl in [A, B, C] else lbl for lbl in y_labels])
 
     classes = np.array(clf.classes_)
@@ -869,7 +869,7 @@ def run_full_epoch_classification_cv(epochs, epochs_cropped, cv_split, params_di
         x_test = epochs_data[test_idx]
         y_test_labels = np.array([triggers_label_dict[c] for c in y_test])
         if BinaryClassification:
-            A, B, C = 'RightHand', 'LeftHand', 'ClosePalm'
+            A, B, C = 'RightHand', 'LeftHand', 'MiddleHand'
             y_test_labels = np.array(['motor_imagery' if lbl in [A, B, C] else lbl
                                        for lbl in y_test_labels])
 
@@ -987,7 +987,7 @@ def run_adaptive_cv(all_epochs, adaptive_block_epochs, cv_split, params_dict,
         x_test = epochs_data[test_idx]
         y_test_labels = np.array([triggers_label_dict[c] for c in y_test])
         if BinaryClassification:
-            A, B, C = 'RightHand', 'LeftHand', 'ClosePalm'
+            A, B, C = 'RightHand', 'LeftHand', 'MiddleHand'
             y_test_labels = np.array(['motor_imagery' if lbl in [A, B, C] else lbl
                                       for lbl in y_test_labels])
 
@@ -1109,7 +1109,7 @@ def run_trial_count_sweep_cv(epochs, epochs_cropped, cv_split, params_dict,
         x_test = epochs_data[test_idx]
         y_test_labels = np.array([triggers_label_dict[c] for c in y_test])
         if BinaryClassification:
-            A, B, C = 'RightHand', 'LeftHand', 'ClosePalm'
+            A, B, C = 'RightHand', 'LeftHand', 'MiddleHand'
             y_test_labels = np.array(
                 ['motor_imagery' if lbl in [A, B, C] else lbl for lbl in y_test_labels]
             )
