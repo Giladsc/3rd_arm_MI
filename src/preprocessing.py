@@ -386,7 +386,9 @@ def get_subject_bad_electrodes(subject):
                     'Tomer' : {'FC5','CP1','F4','TP9','FT8','P5'},
                     'NS' : {'T7','TP10'},
                     'ID' : {'TP9','TP7'},
-                    'LD' : {'TP10','FT8'}
+                    'LD' : {'TP10','FT8'},
+                    'AEH' : {'T8','T7','TP9'},
+                    'BA' : {'T7','T8'}
                 }
     if subject in bad_elecs_dict.keys():
         subject_bad_electrodes=bad_elecs_dict[subject]
