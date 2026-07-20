@@ -132,7 +132,7 @@ def compare_events(actual_events, predicted_events):
     }
 
 
-def compare_events_without_rest(actual_events, predicted_events, rest_label='Rest'):
+def compare_events_without_rest(actual_events, predicted_events, rest_label='FixatedRest'):
     """Compare actual vs predicted events, excluding *rest_label* epochs from accuracy.
 
     Parameters
@@ -461,11 +461,16 @@ def plot_binary_precision_recall_curve(train_inds, validation_inds, params_dict,
     return results_df
 
 def plot_confusion_matrix(conf_mat, class_labels, title="Confusion Matrix"):
-    plt.figure(figsize=(6,5))
-    sns.heatmap(conf_mat, annot=True, fmt='d', cmap='Blues', xticklabels=class_labels, yticklabels=class_labels)
-    plt.xlabel("Predicted Labels")
-    plt.ylabel("True Labels")
-    plt.title(title)
+    conf_mat = np.array(conf_mat, dtype=float)
+    np.nan_to_num(conf_mat, copy=False)
+    is_float = np.any(conf_mat != conf_mat.astype(int))
+    fmt = '.2f' if is_float else 'd'
+    fig, ax = plt.subplots(figsize=(6, 5))
+    disp = ConfusionMatrixDisplay(confusion_matrix=conf_mat, display_labels=class_labels)
+    disp.plot(cmap='Blues', ax=ax, values_format=fmt)
+    ax.set_title(title)
+    plt.grid(False)
+    plt.tight_layout()
     plt.show()
 
 
@@ -667,4 +672,278 @@ def plot_average_confusion_fixed_cv_group(group_results, w_times, t_start, t_end
 
     return avg_matrix, all_labels
 
+
+def plot_permutation_test_confusion(fold_confusion_matrices, normalize=True, axes_handle=None):
+    """
+    Plot the average confusion matrix from the true run of run_permutation_test.
+
+    Works with confusion matrices returned by either scoring method:
+    - majority_vote: fold_confusion_matrices is list of (cm, classes)
+    - windowed_mean: fold_confusion_matrices is list of lists of (cm, classes) per window;
+      the matrix is averaged across folds and all windows.
+
+    Parameters
+    ----------
+    fold_confusion_matrices : list
+        The 4th return value of run_permutation_test.
+    normalize : bool
+        Row-normalize the averaged matrix. Default True.
+    axes_handle : Axes or None
+
+    Returns
+    -------
+    avg_matrix : np.ndarray
+    all_labels : list of str
+    """
+    # Detect format: flat list of (cm, classes) vs nested list of lists
+    if isinstance(fold_confusion_matrices[0], (list, tuple)) and isinstance(fold_confusion_matrices[0][0], np.ndarray):
+        # majority_vote format: [(cm, classes), ...]
+        cms = [cm for cm, _ in fold_confusion_matrices]
+        all_labels = list(fold_confusion_matrices[0][1])
+    else:
+        # windowed_mean format: list of lists of (cm, classes)
+        cms = []
+        all_labels = None
+        for fold in fold_confusion_matrices:
+            for cm, classes in fold:
+                cms.append(cm)
+                if all_labels is None:
+                    all_labels = list(classes)
+
+    avg_matrix = np.mean(np.stack(cms, axis=0), axis=0)
+
+    if normalize:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            row_sums = avg_matrix.sum(axis=1, keepdims=True)
+            row_sums[row_sums == 0] = 1.0
+            avg_matrix = avg_matrix / row_sums
+            avg_matrix = np.nan_to_num(avg_matrix, nan=0.0)
+
+    if axes_handle is None:
+        fig, ax = plt.subplots(figsize=(5, 4))
+    else:
+        ax = axes_handle
+        fig = ax.get_figure()
+
+    disp = ConfusionMatrixDisplay(confusion_matrix=avg_matrix, display_labels=all_labels)
+    disp.plot(cmap='Blues', ax=ax, values_format='.2f' if normalize else '.0f')
+    ax.grid(False)
+    ax.set_title('Permutation Test — True Classifier\nAverage Confusion Matrix', fontsize=11)
+    plt.tight_layout()
+    plt.show()
+    return avg_matrix, all_labels
+
+
+def plot_permutation_test(
+    true_score,
+    perm_scores,
+    p_value,
+    params_dict=None,
+    axes_handle=None,
+    score_tmin=None,
+    score_tmax=None,
+):
+    """
+    Plot the permutation test null distribution as a histogram.
+
+    Parameters
+    ----------
+    true_score : float          Real classifier accuracy (from run_permutation_test).
+    perm_scores : np.ndarray    Null distribution accuracies.
+    p_value : float             Pre-computed p-value.
+    params_dict : dict or None  If provided, reads 'desired_events' for chance level.
+    axes_handle : Axes or None  Existing axes; creates new figure if None.
+    score_tmin : float or None  For axis label only.
+    score_tmax : float or None  For axis label only.
+
+    Returns
+    -------
+    fig, ax
+    """
+    if axes_handle is None:
+        fig, ax = plt.subplots(figsize=(8, 5))
+    else:
+        ax = axes_handle
+        fig = ax.get_figure()
+
+    n_perm = len(perm_scores)
+    ax.hist(perm_scores, bins=max(10, n_perm // 10), color='steelblue',
+            edgecolor='white', alpha=0.8, label='Null distribution')
+    ax.axvline(true_score, color='crimson', linewidth=2.5, linestyle='--',
+               label=f'True score: {true_score:.3f}')
+
+    if params_dict is not None:
+        n_classes = len(params_dict.get('desired_events', []))
+        if n_classes > 0:
+            chance = 1.0 / n_classes
+            ax.axvline(chance, color='gray', linewidth=1.5, linestyle=':',
+                       label=f'Chance ({chance:.2f})')
+
+    ax.text(0.97, 0.95,
+            f'p = {p_value:.3f}  (n={n_perm})',
+            transform=ax.transAxes, ha='right', va='top', fontsize=11,
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
+
+    time_label = ''
+    if score_tmin is not None or score_tmax is not None:
+        lo = f'{score_tmin:.1f}s' if score_tmin is not None else 'start'
+        hi = f'{score_tmax:.1f}s' if score_tmax is not None else 'end'
+        time_label = f' ({lo}–{hi})'
+
+    ax.set_xlabel(f'Mean accuracy{time_label}', fontsize=11)
+    ax.set_ylabel('Count', fontsize=11)
+    ax.set_title('Permutation Test: Null Distribution vs True Classifier Accuracy', fontsize=12)
+    ax.legend(loc='upper left')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+    return fig, ax
+
 # %%
+
+# ---------------------------------------------------------------------------
+# Full-epoch (majority-vote) group plotting
+# ---------------------------------------------------------------------------
+
+def plot_accuracy_group_full_epoch(group_results_full_epoch, n_classes=None,
+                                   figsize=(10, 5)):
+    """
+    Bar chart of per-subject trial-level accuracy for full-epoch majority-vote
+    classification, with fold standard deviation as error bars and a group
+    mean ± SEM band.
+
+    Parameters
+    ----------
+    group_results_full_epoch : list
+        Built with add_subject_to_group_full_epoch.
+    n_classes : int or None
+        Number of classes for the chance-level line.
+        If None, inferred from the first entry's desired_events (if present),
+        otherwise omitted.
+    figsize : tuple
+    """
+    from scipy.stats import sem as scipy_sem
+
+    subject_names = []
+    subject_means = []
+    subject_stds  = []
+
+    for entry in group_results_full_epoch:
+        accs = entry.get('fold_accuracies')
+        if not accs:
+            continue
+        accs = np.array(accs)
+        subject_names.append(entry['subject_name'])
+        subject_means.append(float(np.mean(accs)))
+        subject_stds.append(float(np.std(accs)))
+
+    if len(subject_names) == 0:
+        print("No subjects with fold_accuracies available.")
+        return
+
+    subject_means = np.array(subject_means)
+    subject_stds  = np.array(subject_stds)
+    group_mean    = float(np.mean(subject_means))
+    group_sem     = float(scipy_sem(subject_means))
+
+    # Infer n_classes if not provided
+    if n_classes is None:
+        events = group_results_full_epoch[0].get('desired_events', [])
+        n_classes = len(events) if events else None
+
+    x = np.arange(len(subject_names))
+    fig, ax = plt.subplots(figsize=figsize)
+
+    ax.bar(x, subject_means, yerr=subject_stds, capsize=5,
+           color='steelblue', alpha=0.75, edgecolor='white',
+           error_kw=dict(elinewidth=1.5, ecolor='black', capthick=1.5),
+           label='Mean ± SD (across folds)')
+
+    # Group mean band
+    ax.axhline(group_mean, color='black', linewidth=2.5, linestyle='-',
+               label=f'Group mean ({group_mean:.3f})')
+    ax.fill_between([-0.5, len(subject_names) - 0.5],
+                    group_mean - group_sem, group_mean + group_sem,
+                    color='gray', alpha=0.25, label='±SEM')
+
+    if n_classes is not None:
+        chance = 1.0 / n_classes
+        ax.axhline(chance, color='red', linewidth=1.5, linestyle='--',
+                   label=f'Chance ({chance:.2f})')
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(subject_names, fontsize=11)
+    ax.set_ylabel('Trial accuracy (majority vote)', fontsize=11)
+    ax.set_ylim([0, 1])
+
+    tmin = group_results_full_epoch[0].get('tmin', 0.0)
+    tmax = group_results_full_epoch[0].get('tmax', '?')
+    ax.set_title(f'Full-Epoch Accuracy — {tmin}–{tmax}s '
+                 f'(n={len(subject_names)} subjects)', fontsize=12)
+
+    ax.legend(loc='lower right')
+    ax.grid(True, axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+    return fig, ax
+
+
+def plot_average_confusion_full_epoch_group(group_results_full_epoch,
+                                            normalize=True, figsize=(8, 7)):
+    """
+    Average confusion matrix across all subjects and CV folds for full-epoch
+    majority-vote results, then plot.
+
+    Parameters
+    ----------
+    group_results_full_epoch : list
+        Built with add_subject_to_group_full_epoch.
+    normalize : bool
+        If True, row-normalise so each row sums to 1.
+    figsize : tuple
+    """
+    from sklearn.metrics import ConfusionMatrixDisplay
+
+    all_matrices = []
+    all_labels   = None
+
+    for entry in group_results_full_epoch:
+        fold_cms = entry.get('fold_confusion_matrices')
+        if not fold_cms:
+            continue
+        for cm, labels in fold_cms:
+            all_matrices.append(np.array(cm, dtype=float))
+            if all_labels is None:
+                all_labels = labels
+
+    if len(all_matrices) == 0:
+        print("No confusion matrices found in group_results_full_epoch.")
+        return None
+
+    avg_matrix = np.mean(np.stack(all_matrices, axis=0), axis=0)
+
+    if normalize:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            row_sums = avg_matrix.sum(axis=1, keepdims=True)
+            row_sums[row_sums == 0] = 1.0
+            avg_matrix = avg_matrix / row_sums
+            avg_matrix = np.nan_to_num(avg_matrix, nan=0.0)
+
+    if all_labels is None:
+        all_labels = [str(i) for i in range(avg_matrix.shape[0])]
+
+    tmin = group_results_full_epoch[0].get('tmin', 0.0)
+    tmax = group_results_full_epoch[0].get('tmax', '?')
+    n_subj = len(group_results_full_epoch)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    disp = ConfusionMatrixDisplay(confusion_matrix=avg_matrix,
+                                  display_labels=all_labels)
+    disp.plot(cmap='Blues', ax=ax, values_format='.2f' if normalize else '.0f')
+    ax.grid(False)
+    ax.set_title(f'Group Avg Confusion — Full Epoch ({tmin}–{tmax}s)\n'
+                 f'({n_subj} subjects, averaged across folds)', fontsize=12)
+    plt.tight_layout()
+    plt.show()
+
+    return avg_matrix, all_labels

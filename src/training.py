@@ -380,7 +380,7 @@ def _slice_window_block(x4, start, length):
         window = window[..., 0]                       # back to (E, C, L) if no FB
     return window
 
-def run_windowed_classification_aug_cv(epochs, epochs_cropped, cv_split, params_dict, BinaryClassification=False):
+def run_windowed_classification_aug_cv(epochs, epochs_cropped, cv_split, params_dict, BinaryClassification=False, labels_override=None):
     """
     Train-and-evaluate windowed classifiers with in-fold augmentation, avoiding leakage.
 
@@ -433,8 +433,9 @@ def run_windowed_classification_aug_cv(epochs, epochs_cropped, cv_split, params_
     # ---------- Cross-validation ----------
     for train_idx, test_idx in cv_split:
         # Labels (ints) per fold
-        y_train = epochs_cropped.events[train_idx, -1]
-        y_test  = epochs_cropped.events[test_idx,  -1]
+        _labels = labels_override if labels_override is not None else epochs_cropped.events[:, -1]
+        y_train = _labels[train_idx]
+        y_test  = _labels[test_idx]
 
         # Training features slice (support 3D or 4D with filterbanks)
         if epochs_cropped_data.ndim == 3:
@@ -478,6 +479,121 @@ def run_windowed_classification_aug_cv(epochs, epochs_cropped, cv_split, params_
     w_times = (w_start + w_length ) / sfreq + params_dict['epoch_tmin']
     
     return scores_windows, folds_confusion_matrices_per_window, w_times
+
+
+def run_permutation_test(
+    epochs,
+    epochs_cropped,
+    params_dict,
+    n_permutations=100,
+    score_method='majority_vote',
+    eval_tmin=0.0,
+    eval_tmax=5.0,
+    BinaryClassification=False,
+    random_state=None,
+):
+    """
+    Validate classifier performance against a null distribution of shuffled labels.
+
+    Runs the full CV pipeline N times with randomly permuted labels to build a
+    null distribution, then computes a p-value as the fraction of permutations
+    that matched or exceeded the true accuracy.
+
+    Parameters
+    ----------
+    epochs : mne.Epochs          Uncropped epochs.
+    epochs_cropped : mne.Epochs  Cropped epochs used for training.
+    params_dict : dict           Pipeline configuration.
+    n_permutations : int         Number of label shuffles. Default 100; use >=1000 for publication.
+    score_method : str
+        'majority_vote' (default) — uses run_full_epoch_classification_cv: majority vote across
+            windows in [eval_tmin, eval_tmax], one prediction per trial. Matches what
+            run_full_epoch_classification_cv returns and gives a score comparable to what you
+            see when calling that function directly.
+        'windowed_mean' — uses run_windowed_classification_aug_cv: mean accuracy across all
+            windows and folds. Lower than majority_vote for the same data.
+    eval_tmin : float  Start of the evaluation window (s, relative to event onset). Default 0.0.
+    eval_tmax : float  End of the evaluation window (s). Default 5.0.
+    BinaryClassification : bool  Passed through to the CV function.
+    random_state : int or None   Seeds numpy RNG for reproducibility.
+
+    Returns
+    -------
+    true_score : float           Scalar accuracy from real labels.
+    perm_scores : np.ndarray     Shape (n_permutations,) — accuracy for each permuted run.
+    p_value : float              (count >= true_score + 1) / (n_permutations + 1).
+    """
+    try:
+        from tqdm.auto import tqdm as _tqdm
+    except ImportError:
+        from tqdm import tqdm as _tqdm
+
+    if score_method not in ('majority_vote', 'windowed_mean'):
+        raise ValueError(f"score_method must be 'majority_vote' or 'windowed_mean', got {score_method!r}")
+
+    rng = np.random.default_rng(random_state)
+    true_labels = epochs_cropped.events[:, -1].copy()
+    X_for_split = epochs_cropped.get_data()
+
+    def _run_and_score(cv_split_iter, labels_override=None):
+        """Returns (scalar_score, fold_confusion_matrices or None)."""
+        if score_method == 'majority_vote':
+            fold_accs, fold_cms = run_full_epoch_classification_cv(
+                epochs, epochs_cropped, cv_split_iter, params_dict,
+                tmin=eval_tmin, tmax=eval_tmax,
+                BinaryClassification=BinaryClassification,
+                labels_override=labels_override,
+            )
+            return float(np.mean(fold_accs)), fold_cms
+        else:
+            scores_windows, fold_cms_per_window, w_times = run_windowed_classification_aug_cv(
+                epochs, epochs_cropped, cv_split_iter, params_dict,
+                BinaryClassification=BinaryClassification,
+                labels_override=labels_override,
+            )
+            arr = np.array(scores_windows)
+            lo, hi = eval_tmin, eval_tmax
+            mask = (w_times >= lo) & (w_times <= hi)
+            if not mask.any():
+                raise ValueError(
+                    f"No windows in [{lo}, {hi}] s. "
+                    f"w_times range: [{w_times[0]:.2f}, {w_times[-1]:.2f}]"
+                )
+            return float(np.mean(arr[:, mask])), fold_cms_per_window
+
+    print(f"Starting permutation test: {n_permutations} permutations × 10 CV folds "
+          f"(score_method='{score_method}', eval window [{eval_tmin}, {eval_tmax}] s). "
+          f"Expected runtime ≈ {n_permutations}× a single CV run.")
+
+    cv_true = StratifiedShuffleSplit(10, test_size=0.2, random_state=42)
+    true_score, true_fold_cms = _run_and_score(cv_true.split(X_for_split, true_labels))
+
+    def _cms_to_flat(fold_cms):
+        """Yield every (cm, classes) pair regardless of format (flat or windowed)."""
+        for item in fold_cms:
+            if isinstance(item, tuple) and isinstance(item[0], np.ndarray):
+                yield item                          # majority_vote: (cm, classes)
+            else:
+                for sub in item:                    # windowed_mean: (cm, classes) per window
+                    yield sub
+
+    perm_scores = np.zeros(n_permutations)
+    perm_cm_sum = None
+    perm_classes = None
+    for i in _tqdm(range(n_permutations), desc="Permutations", unit="perm"):
+        perm_labels = rng.permutation(true_labels)
+        cv_perm = ShuffleSplit(10, test_size=0.2, random_state=int(rng.integers(0, 2**31)))
+        perm_scores[i], perm_fold_cms = _run_and_score(cv_perm.split(X_for_split), labels_override=perm_labels)
+        for cm, classes in _cms_to_flat(perm_fold_cms):
+            if perm_cm_sum is None:
+                perm_cm_sum = cm.astype(float).copy()
+                perm_classes = list(classes)
+            else:
+                perm_cm_sum += cm
+
+    p_value = (np.sum(perm_scores >= true_score) + 1) / (n_permutations + 1)
+    return true_score, perm_scores, p_value, true_fold_cms, perm_cm_sum, perm_classes
+
 
 def run_windowed_classification_aug(epochs_cropped,train_set_data,train_set_labels,train_set_data_uncroped,test_y,params_dict,BinaryClassification):
     augmentation_params=params_dict['augmentation_params']
@@ -565,3 +681,206 @@ def sanity_check_trained_clf(trained_clf, epochs, params_dict, BinaryClassificat
 
     # Wrap in a list to match the CV output format (list of folds)
     return [scores_windows], [confusion_matrices_per_window], w_times
+
+
+def evaluate_full_epoch(clf, epochs, params_dict, tmin=0.0, tmax=5.0, BinaryClassification=False):
+    """
+    Classify each trial using majority vote across all sliding windows within [tmin, tmax].
+
+    The classifier sees the same window size it was trained on; the final
+    per-trial label is decided by a majority vote across every window that
+    fits inside the specified epoch range.  This gives one decision per
+    trial rather than one score per time window.
+
+    Parameters
+    ----------
+    clf : fitted sklearn pipeline / classifier
+        Must expose `.predict()` and `.classes_`.
+    epochs : mne.Epochs
+        UNCROPPED epochs to evaluate on (must cover [tmin, tmax]).
+    params_dict : dict
+        Must contain:
+        - 'windowed_prediction_params': {'win_len': float, 'win_step': float}
+        - 'epoch_tmin': float  (start of the epoch relative to event onset)
+        - 'events_trigger_dict': {str: int}
+    tmin, tmax : float
+        Time range in seconds, relative to event onset (t=0), to use for
+        the majority vote.  Default 0–5 s (the MI execution window).
+    BinaryClassification : bool
+        Collapse MI classes into 'motor_imagery' if True.
+
+    Returns
+    -------
+    accuracy : float
+        Fraction of trials correctly classified by majority vote.
+    cm_tuple : (np.ndarray, np.ndarray)
+        (confusion_matrix, class_labels).
+    trial_predictions : np.ndarray of str
+        Majority-vote label for every trial.
+    """
+    windowed_prediction_params = params_dict['windowed_prediction_params']
+    win_len = float(windowed_prediction_params['win_len'])
+    win_step = float(windowed_prediction_params['win_step'])
+
+    sfreq = epochs.info['sfreq']
+    epoch_tmin = params_dict['epoch_tmin']
+    epochs_data = epochs.get_data()
+
+    # Convert tmin/tmax to sample indices relative to the start of the stored epoch
+    start_sample = int(round((tmin - epoch_tmin) * sfreq))
+    end_sample = int(round((tmax - epoch_tmin) * sfreq))
+    start_sample = max(0, start_sample)
+    end_sample = min(epochs_data.shape[2], end_sample)
+
+    w_length = int(round(sfreq * win_len))
+    w_step_samp = int(round(sfreq * win_step))
+
+    w_start = np.arange(start_sample, end_sample - w_length + 1, w_step_samp)
+    if len(w_start) == 0:
+        raise ValueError(
+            f"No windows fit in [{tmin}, {tmax}]s with win_len={win_len}s. "
+            f"Sample range [{start_sample}, {end_sample}], w_length={w_length}."
+        )
+
+    # Map integer trigger codes to string labels
+    triggers_label_dict = {val: key for key, val in params_dict['events_trigger_dict'].items()}
+    y_labels = np.array([triggers_label_dict[code] for code in epochs.events[:, -1]])
+    if BinaryClassification:
+        A, B, C = 'RightHand', 'LeftHand', 'ClosePalm'
+        y_labels = np.array(['motor_imagery' if lbl in [A, B, C] else lbl for lbl in y_labels])
+
+    classes = np.array(clf.classes_)
+    assert_same_label_space(y_labels, classes)
+
+    # Collect per-trial predictions from every window → shape (n_windows, n_trials)
+    all_window_preds = []
+    for n in w_start:
+        window_data = _slice_window_block(epochs_data, n, w_length)
+        all_window_preds.append(clf.predict(window_data))
+
+    all_window_preds = np.array(all_window_preds).T  # (n_trials, n_windows)
+
+    # Majority vote: one label per trial (np.unique works on string arrays)
+    trial_preds = np.array([
+        vals[np.argmax(counts)]
+        for vals, counts in (np.unique(row, return_counts=True) for row in all_window_preds)
+    ])
+
+    accuracy = float(np.mean(trial_preds == y_labels))
+    cm = confusion_matrix(y_labels, trial_preds, labels=classes)
+
+    return accuracy, (cm, classes), trial_preds
+
+
+def run_full_epoch_classification_cv(epochs, epochs_cropped, cv_split, params_dict,
+                                      tmin=0.0, tmax=5.0, BinaryClassification=False,
+                                      labels_override=None):
+    """
+    CV loop that trains on the cropped window (with augmentation) and evaluates
+    each test trial using majority vote across all windows in [tmin, tmax].
+
+    Returns per-fold trial-level accuracy and confusion matrices rather than
+    per-window scores.  Use this alongside (or instead of)
+    run_windowed_classification_aug_cv when you want a single classification
+    decision per epoch.
+
+    Parameters
+    ----------
+    epochs : mne.Epochs
+        UNCROPPED epochs (used for test evaluation).
+    epochs_cropped : mne.Epochs
+        CROPPED epochs (used for training / augmentation).
+    cv_split : iterable of (train_idx, test_idx)
+    params_dict : dict
+        Same structure as for run_windowed_classification_aug_cv.
+    tmin, tmax : float
+        Epoch range (seconds, relative to event onset) to use for the
+        majority-vote classification.  Default 0–5 s.
+    BinaryClassification : bool
+
+    Returns
+    -------
+    fold_accuracies : list of float
+        One accuracy per CV fold.
+    fold_confusion_matrices : list of (cm, classes)
+        One confusion matrix per CV fold.
+    """
+    from .preprocessing import augment_data
+
+    augmentation_params = params_dict['augmentation_params']
+    windowed_prediction_params = params_dict['windowed_prediction_params']
+    win_len = float(windowed_prediction_params['win_len'])
+    win_step = float(windowed_prediction_params['win_step'])
+
+    sfreq = epochs.info['sfreq']
+    epoch_tmin = params_dict['epoch_tmin']
+
+    epochs_data = epochs.get_data()
+    epochs_cropped_data = epochs_cropped.get_data()
+
+    assert epochs.events.shape[0] == epochs_cropped.events.shape[0], "Epoch count mismatch"
+    assert np.all(epochs.events[:, -1] == epochs_cropped.events[:, -1]), "Label mismatch epochs vs epochs_cropped"
+
+    w_length = int(round(sfreq * win_len))
+    w_step_samp = int(round(sfreq * win_step))
+
+    # Sample range for [tmin, tmax]
+    start_sample = max(0, int(round((tmin - epoch_tmin) * sfreq)))
+    end_sample = min(epochs_data.shape[2], int(round((tmax - epoch_tmin) * sfreq)))
+    w_start_eval = np.arange(start_sample, end_sample - w_length + 1, w_step_samp)
+
+    if len(w_start_eval) == 0:
+        raise ValueError(
+            f"No windows fit in [{tmin}, {tmax}]s with win_len={win_len}s."
+        )
+
+    triggers_label_dict = {val: key for key, val in params_dict['events_trigger_dict'].items()}
+
+    fold_accuracies = []
+    fold_confusion_matrices = []
+
+    for train_idx, test_idx in cv_split:
+        _labels = labels_override if labels_override is not None else epochs_cropped.events[:, -1]
+        y_train = _labels[train_idx]
+        y_test = _labels[test_idx]
+
+        if epochs_cropped_data.ndim == 3:
+            x_train_source = epochs_cropped_data[train_idx]
+        else:
+            x_train_source = epochs_cropped_data[train_idx]
+
+        augmented_x, augmented_y = augment_data(augmentation_params, x_train_source, y_train, sfreq)
+
+        clf, _, _ = classifier_training(augmented_x, augmented_y, params_dict,
+                                        BinaryClassification=BinaryClassification)
+
+        x_test = epochs_data[test_idx]
+        y_test_labels = np.array([triggers_label_dict[c] for c in y_test])
+        if BinaryClassification:
+            A, B, C = 'RightHand', 'LeftHand', 'ClosePalm'
+            y_test_labels = np.array(['motor_imagery' if lbl in [A, B, C] else lbl
+                                       for lbl in y_test_labels])
+
+        classes = np.array(clf.classes_)
+        assert_same_label_space(y_test_labels, classes)
+
+        # Collect window predictions for test trials
+        all_window_preds = []
+        for n in w_start_eval:
+            window_data = _slice_window_block(x_test, n, w_length)
+            all_window_preds.append(clf.predict(window_data))
+
+        all_window_preds = np.array(all_window_preds).T  # (n_test_trials, n_windows)
+
+        trial_preds = np.array([
+            vals[np.argmax(counts)]
+            for vals, counts in (np.unique(row, return_counts=True) for row in all_window_preds)
+        ])
+
+        fold_acc = float(np.mean(trial_preds == y_test_labels))
+        cm = confusion_matrix(y_test_labels, trial_preds, labels=classes)
+
+        fold_accuracies.append(fold_acc)
+        fold_confusion_matrices.append((cm, classes))
+
+    return fold_accuracies, fold_confusion_matrices
