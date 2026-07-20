@@ -9,7 +9,10 @@
       "Bash(git mv:*)",
       "PowerShell(Get-ChildItem -Path \"c:\\\\Users\\\\CensorLab\\\\3rd_arm_MI\" | Where-Object {$_.PSIsContainer} | ForEach-Object {$_.Name})",
       "PowerShell(Get-ChildItem -Path \"c:\\\\Users\\\\CensorLab\\\\3rd_arm_MI\\\\src\" | ForEach-Object {$_.Name})",
-      "PowerShell(Get-ChildItem -Path \"c:\\\\Users\\\\CensorLab\\\\3rd_arm_MI\\\\notebooks\" | ForEach-Object {$_.Name})"
+      "PowerShell(Get-ChildItem -Path \"c:\\\\Users\\\\CensorLab\\\\3rd_arm_MI\\\\notebooks\" | ForEach-Object {$_.Name})",
+      "Bash(export PYTHONIOENCODING=utf-8)",
+      "Bash(python - __TRACKED_VAR__/ours.ipynb __TRACKED_VAR__/theirs.ipynb __TRACKED_VAR__/uniq_report.txt)",
+      "Bash(python - __TRACKED_VAR__/ours.ipynb __TRACKED_VAR__/theirs.ipynb)"
     ]
   }
 }
