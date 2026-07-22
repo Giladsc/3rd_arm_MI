@@ -37,10 +37,12 @@ from sklearn.svm import SVC  # Support Vector Classifier
 from sklearn.multiclass import OneVsOneClassifier
 from sklearn.model_selection import ShuffleSplit, cross_val_score,train_test_split
 from sklearn.metrics import confusion_matrix,ConfusionMatrixDisplay
-from sklearn.model_selection import cross_val_score, StratifiedShuffleSplit, train_test_split
+from sklearn.model_selection import cross_val_score, StratifiedShuffleSplit, StratifiedKFold, train_test_split
+from sklearn.base import clone
 from pyriemann.estimation import ERPCovariances, XdawnCovariances, Xdawn, Covariances
 from pyriemann.tangentspace import TangentSpace
 from pyriemann.classification import MDM
+from pyriemann.utils.tangentspace import unupper
 
 #import moab to get the filterbank implementation: 
 from moabb.pipelines.utils import FilterBank
@@ -1036,3 +1038,314 @@ def plot_trial_count_sweep(sweep_results, n_classes=None, title=None, save_path=
 
     plt.show()
     return fig, axes
+
+
+def _extract_fgda_ts_features(clf, X, y, params_dict):
+    """
+    Run raw epoch/window data through a fitted ts+FGDA pipeline's cov/fgda/ts steps,
+    and map integer trigger-code labels to their class-name strings.
+
+    Parameters
+    ----------
+    clf : sklearn.pipeline.Pipeline
+        Fitted pipeline with named steps 'cov', 'fgda', 'ts' (as built by
+        classifier_training() for pipeline_name='ts+FGDA').
+    X : np.ndarray, shape (n_samples, n_channels, n_times)
+        Epoch or window data, e.g. train_set_data or augmented_x. Must already be
+        aligned with y (one label per sample along axis 0) — this function does not
+        expand/repeat labels itself.
+    y : np.ndarray, shape (n_samples,)
+        Integer trigger codes matching X, e.g. train_set_labels or augmented_y.
+    params_dict : dict
+        Must contain 'events_trigger_dict' ({class_name: trigger_code}).
+
+    Returns
+    -------
+    ts_vectors : np.ndarray, shape (n_samples, n_channels * (n_channels + 1) / 2)
+    labels_mapped : np.ndarray of str, shape (n_samples,)
+    """
+    covs = clf.named_steps['cov'].transform(X)
+    fgda_out = clf.named_steps['fgda'].transform(covs)
+    ts_vectors = clf.named_steps['ts'].transform(fgda_out)
+
+    triggers_label_dict = {val: key for key, val in params_dict['events_trigger_dict'].items()}
+    labels_mapped = np.array([triggers_label_dict[label] for label in y])
+
+    return ts_vectors, labels_mapped
+
+
+def plot_fgda_lda_scatter(clf, X, y, params_dict, n_components=2, palette='Set1', axes_handle=None):
+    """
+    2D LDA projection of ts+FGDA tangent-space features, colored by class.
+
+    Parameters
+    ----------
+    clf : sklearn.pipeline.Pipeline
+        Fitted ts+FGDA pipeline (see _extract_fgda_ts_features).
+    X : np.ndarray, shape (n_samples, n_channels, n_times)
+    y : np.ndarray, shape (n_samples,)
+        Integer trigger codes aligned with X.
+    params_dict : dict
+    n_components : int, default=2
+        Number of LDA components to fit; only the first two are plotted.
+    palette : str, default='Set1'
+    axes_handle : Axes or None
+
+    Returns
+    -------
+    fig, ax
+    lda : fitted LinearDiscriminantAnalysis
+    X_transformed : np.ndarray, shape (n_samples, n_components)
+    """
+    ts_vectors, labels_mapped = _extract_fgda_ts_features(clf, X, y, params_dict)
+
+    lda = LinearDiscriminantAnalysis(n_components=n_components)
+    X_transformed = lda.fit_transform(ts_vectors, labels_mapped)
+
+    plot_data = pd.DataFrame({
+        'Component_1': X_transformed[:, 0],
+        'Component_2': X_transformed[:, 1],
+        'Movement': labels_mapped,
+    })
+
+    if axes_handle is None:
+        fig, ax = plt.subplots(figsize=(12, 10))
+    else:
+        ax = axes_handle
+        fig = ax.get_figure()
+
+    sns.scatterplot(data=plot_data, x='Component_1', y='Component_2', hue='Movement',
+                     palette=palette, legend='full', alpha=0.7, s=40, ax=ax)
+    ax.set_title('Hand Movements Separation in FGDA & LDA projection', fontsize=14)
+    ax.set_xlabel('Discriminant Component 1', fontsize=12)
+    ax.set_ylabel('Discriminant Component 2', fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.show()
+
+    return fig, ax, lda, X_transformed
+
+
+def plot_fgda_lda_scatter_cv(clf, X, y, params_dict, cv=None, n_components=2,
+                             palette='Set1', axes_handle=None, random_state=42):
+    """
+    Cross-validated (held-out) 2D LDA projection of ts+FGDA features.
+
+    Unlike plot_fgda_lda_scatter, no point is used to fit the projection it is
+    drawn in: for every CV fold the cov/fgda/ts feature extractor AND the
+    visualization LDA are fit on the training split only, then the held-out test
+    split is projected through them. This yields realistic class overlap that is
+    directly comparable to a cross-validated confusion matrix, rather than the
+    over-optimistic separation of an in-sample supervised projection.
+
+    Because an LDA fit independently per fold is defined only up to an orthogonal
+    transform (sign flips / axis swaps / rotation), each fold's held-out
+    projection is aligned into a shared reference frame via orthogonal Procrustes
+    on the training-class centroids. The reference frame comes from one in-sample
+    LDA fit on all data — it fixes only the plot's orientation and never
+    contributes a plotted point or a decision boundary.
+
+    Parameters
+    ----------
+    clf : sklearn.pipeline.Pipeline
+        Fitted ts+FGDA pipeline; its 'cov'/'fgda'/'ts' steps are cloned (with their
+        hyperparameters) and re-fit per fold, so the passed clf is not modified.
+    X : np.ndarray, shape (n_samples, n_channels, n_times)
+    y : np.ndarray, shape (n_samples,)
+        Integer trigger codes aligned with X.
+    params_dict : dict
+        Must contain 'events_trigger_dict'.
+    cv : cross-validation splitter, int, or None
+        Splitter instance (e.g. the notebook's StratifiedShuffleSplit, for parity
+        with the confusion-matrix CV), an int (-> StratifiedKFold with that many
+        splits), or None (-> StratifiedKFold(5, shuffle=True)).
+    n_components : int, default=2
+        Number of LDA components; capped at n_classes - 1. Only two are plotted.
+    palette : str, default='Set1'
+    axes_handle : Axes or None
+    random_state : int, default=42
+        Used only when cv is None or an int.
+
+    Returns
+    -------
+    fig, ax
+    proj_all : np.ndarray, shape (n_heldout_points, 2)
+        Aligned held-out projections (a sample may appear more than once if the
+        splitter's test sets overlap, e.g. StratifiedShuffleSplit).
+    labels_all : np.ndarray of str
+        True class name for each held-out point.
+    """
+    from scipy.linalg import orthogonal_procrustes
+
+    triggers_label_dict = {val: key for key, val in params_dict['events_trigger_dict'].items()}
+    y_names = np.array([triggers_label_dict[label] for label in y])
+    classes = np.unique(y_names)
+    n_classes = len(classes)
+
+    n_comp = min(n_components, n_classes - 1)
+    if n_comp < 2:
+        raise ValueError(
+            f"A 2D CV projection needs >= 3 classes (LDA yields at most "
+            f"n_classes - 1 = {n_classes - 1} components); got {n_classes} classes."
+        )
+
+    if cv is None:
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+    elif isinstance(cv, int):
+        cv = StratifiedKFold(n_splits=cv, shuffle=True, random_state=random_state)
+
+    def _feature_extractor():
+        return Pipeline([
+            ('cov', clone(clf.named_steps['cov'])),
+            ('fgda', clone(clf.named_steps['fgda'])),
+            ('ts', clone(clf.named_steps['ts'])),
+        ])
+
+    def _centroids(proj, labels):
+        return np.vstack([proj[labels == c].mean(axis=0) for c in classes])
+
+    # Reference orientation only (in-sample): defines stable plot axes so per-fold
+    # projections can be rotated into a common frame. Not plotted, no boundary.
+    ref_ts = _feature_extractor().fit_transform(X, y_names)
+    ref_proj = LinearDiscriminantAnalysis(n_components=n_comp).fit_transform(ref_ts, y_names)
+    ref_centroids = _centroids(ref_proj, y_names)
+
+    proj_parts, label_parts = [], []
+    for train_idx, test_idx in cv.split(np.zeros(len(y_names)), y_names):
+        feat = _feature_extractor()
+        ts_train = feat.fit_transform(X[train_idx], y_names[train_idx])
+        ts_test = feat.transform(X[test_idx])
+
+        lda = LinearDiscriminantAnalysis(n_components=n_comp)
+        lda.fit(ts_train, y_names[train_idx])
+        train_proj = lda.transform(ts_train)
+        test_proj = lda.transform(ts_test)
+
+        # Align this fold's arbitrary orientation to the shared reference frame.
+        R, _ = orthogonal_procrustes(_centroids(train_proj, y_names[train_idx]), ref_centroids)
+        proj_parts.append(test_proj @ R)
+        label_parts.append(y_names[test_idx])
+
+    proj_all = np.vstack(proj_parts)
+    labels_all = np.concatenate(label_parts)
+
+    plot_data = pd.DataFrame({
+        'Component_1': proj_all[:, 0],
+        'Component_2': proj_all[:, 1],
+        'Movement': labels_all,
+    })
+
+    if axes_handle is None:
+        fig, ax = plt.subplots(figsize=(12, 10))
+    else:
+        ax = axes_handle
+        fig = ax.get_figure()
+
+    sns.scatterplot(data=plot_data, x='Component_1', y='Component_2', hue='Movement',
+                     palette=palette, legend='full', alpha=0.7, s=40, ax=ax)
+    ax.set_title('Held-out FGDA & LDA projection (cross-validated)', fontsize=14)
+    ax.set_xlabel('Discriminant Component 1', fontsize=12)
+    ax.set_ylabel('Discriminant Component 2', fontsize=12)
+    ax.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.show()
+
+    return fig, ax, proj_all, labels_all
+
+
+def plot_fgda_lda_pairplot(clf, X, y, params_dict, max_components=4, palette='Set1'):
+    """
+    Full-rank LDA fit on ts+FGDA features: prints explained variance ratio and
+    pairplots the first max_components discriminant components.
+
+    Parameters
+    ----------
+    clf : sklearn.pipeline.Pipeline
+        Fitted ts+FGDA pipeline (see _extract_fgda_ts_features).
+    X : np.ndarray, shape (n_samples, n_channels, n_times)
+    y : np.ndarray, shape (n_samples,)
+        Integer trigger codes aligned with X.
+    params_dict : dict
+    max_components : int, default=4
+        Number of leading components to include in the pairplot (capped at the
+        LDA's full rank, min(n_classes - 1, n_features)).
+    palette : str, default='Set1'
+
+    Returns
+    -------
+    pairgrid : seaborn.PairGrid
+    lda : fitted LinearDiscriminantAnalysis (n_components=None, full rank)
+    explained_variance_ratio_ : np.ndarray
+    """
+    ts_vectors, labels_mapped = _extract_fgda_ts_features(clf, X, y, params_dict)
+
+    lda = LinearDiscriminantAnalysis(n_components=None)
+    X_all_components = lda.fit_transform(ts_vectors, labels_mapped)
+
+    print("Explained variance ratio for all components:", lda.explained_variance_ratio_)
+
+    n_components_to_plot = min(max_components, X_all_components.shape[1])
+    columns = [f'C{i + 1}' for i in range(n_components_to_plot)]
+    df_components = pd.DataFrame(X_all_components[:, :n_components_to_plot], columns=columns)
+    df_components['Movement'] = labels_mapped
+
+    pairgrid = sns.pairplot(df_components, hue='Movement', palette=palette, diag_kind=None)
+    plt.show()
+
+    return pairgrid, lda, lda.explained_variance_ratio_
+
+
+def plot_lda_channel_pair_loadings(clf, lda, ch_names, component=0, cmap='RdBu_r', axes_handle=None):
+    """
+    Map an LDA discriminant axis back onto electrode-pair covariance terms.
+
+    ts+FGDA features are the weighted upper-triangular vectorization of the
+    (FGDA-filtered) covariance matrix (pyriemann.utils.tangentspace.upper). Since
+    lda.scalings_[:, component] is a loading vector in that same feature space,
+    unupper() reconstructs it into an (n_channels, n_channels) symmetric matrix,
+    showing which electrode-pair covariances drive that discriminant component.
+
+    Parameters
+    ----------
+    clf : sklearn.pipeline.Pipeline
+        Fitted ts+FGDA pipeline (used only to confirm channel count via 'ts' step).
+    lda : fitted LinearDiscriminantAnalysis
+        As returned by plot_fgda_lda_scatter or plot_fgda_lda_pairplot.
+    ch_names : list of str, length n_channels
+        Channel names in the same order as the data fed into clf, e.g.
+        epochs_cropped.info['ch_names'].
+    component : int, default=0
+        Index of the discriminant axis (column of lda.scalings_) to visualize.
+    cmap : str, default='RdBu_r'
+    axes_handle : Axes or None
+
+    Returns
+    -------
+    fig, ax
+    loading_matrix : np.ndarray, shape (n_channels, n_channels)
+    """
+    n_channels = len(ch_names)
+    loading_vec = lda.scalings_[:, component]
+    loading_matrix = unupper(loading_vec[np.newaxis, :])[0]
+
+    if loading_matrix.shape != (n_channels, n_channels):
+        raise ValueError(
+            f"ch_names has {n_channels} entries but the loading vector reconstructs to "
+            f"{loading_matrix.shape} — check that ch_names matches the channels clf was fit on."
+        )
+
+    if axes_handle is None:
+        fig, ax = plt.subplots(figsize=(10, 9))
+    else:
+        ax = axes_handle
+        fig = ax.get_figure()
+
+    vmax = np.abs(loading_matrix).max()
+    sns.heatmap(loading_matrix, xticklabels=ch_names, yticklabels=ch_names,
+                cmap=cmap, center=0, vmin=-vmax, vmax=vmax, square=True, ax=ax,
+                cbar_kws={'label': 'Discriminant loading'})
+    ax.set_title(f'LDA Component {component + 1} — Channel-Pair Loadings', fontsize=13)
+    plt.tight_layout()
+    plt.show()
+
+    return fig, ax, loading_matrix
