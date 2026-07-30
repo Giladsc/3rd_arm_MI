@@ -15,7 +15,8 @@
       "Bash(python -c ' *)",
       "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
       "Bash(pip show *)",
-      "Bash(python -m pip list)"
+      "Bash(python -m pip list)",
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)"
     ]
   }
 }

@@ -1,0 +1,31 @@
+{
+ "BA": {
+  "exclude": [
+   0,
+   4,
+   5,
+   6,
+   10,
+   13,
+   15,
+   17,
+   20,
+   21,
+   24,
+   25,
+   27,
+   29,
+   30,
+   31,
+   37,
+   40,
+   41,
+   44,
+   51,
+   52,
+   55
+  ],
+  "note": "carried over from the single-subject Main2.ipynb run",
+  "reviewed": "2026-07-30"
+ }
+}

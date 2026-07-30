@@ -42,7 +42,28 @@ from sklearn.base import clone
 from pyriemann.estimation import ERPCovariances, XdawnCovariances, Xdawn, Covariances
 from pyriemann.tangentspace import TangentSpace
 from pyriemann.classification import MDM
-from pyriemann.utils.tangentspace import unupper
+try:
+    # pyriemann >= 0.4 exposes unupper directly.
+    from pyriemann.utils.tangentspace import unupper
+except ImportError:
+    # pyriemann 0.3 factored this convention inside tangent_space/untangent_space
+    # and never exposed it. Reimplement the inverse of pyriemann.upper():
+    # un-vectorize the weighted upper triangle (off-diagonal terms scaled by sqrt(2))
+    # back into a symmetric matrix. Convention matches TangentSpace/FGDA vectorization.
+    def unupper(T):
+        T = np.asarray(T, dtype=float)
+        d = T.shape[-1]
+        n = int((np.sqrt(8 * d + 1) - 1) / 2)
+        if n * (n + 1) // 2 != d:
+            raise ValueError(f"length {d} is not n*(n+1)/2 for any integer n")
+        idx = np.triu_indices(n)
+        coeffs = (np.sqrt(2) * np.triu(np.ones((n, n)), 1) + np.eye(n))[idx]
+        X = np.zeros(T.shape[:-1] + (n, n))
+        X[..., idx[0], idx[1]] = T / coeffs
+        di = np.arange(n)
+        diag = np.zeros_like(X)
+        diag[..., di, di] = X[..., di, di]
+        return X + np.swapaxes(X, -1, -2) - diag
 
 #import moab to get the filterbank implementation: 
 from moabb.pipelines.utils import FilterBank

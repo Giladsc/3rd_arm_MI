@@ -3,10 +3,15 @@ Data/
 Models/
 Recordings/
 TFRs/
+TFRs_morlet/
+TFRs_percent/
 
 # Generated outputs
 Figures/
 hyper_param_search_outputs/
+
+# Rebuildable pre-ICA epochs and fitted ICA (see src/tfr_batch.py)
+Cache/
 
 # Scratch/temp files
 foo.csv

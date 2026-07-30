@@ -199,6 +199,286 @@ def balance_epochs_by_subsampling(epochs, class_to_subsample='Rating'):
 
     return balanced_epochs
 
+
+def epochs_to_continuous_raw(epochs, mark_cue=True, cue_label='cue'):
+    """
+    Flatten Epochs into a continuous Raw, annotated with the epoch structure.
+
+    Concatenating epochs creates artificial edges that look like real events, so the
+    returned Raw carries one annotation span per epoch, labelled with its condition
+    (the MNE browser then colours trials by class), plus an optional zero-duration
+    marker at each epoch's t=0 (cue onset).
+
+    Parameters
+    ----------
+    epochs : mne.Epochs
+        Epochs to flatten. Their data are concatenated along time in epoch order.
+    mark_cue : bool
+        Add a zero-duration marker at t=0 of every epoch. Only applies when
+        ``epochs.tmin < 0`` (otherwise t=0 coincides with the epoch onset).
+    cue_label : str
+        Description used for the cue markers.
+
+    Returns
+    -------
+    raw : mne.io.RawArray
+        Continuous Raw of shape (n_channels, n_epochs * n_times) with annotations.
+    """
+    data = epochs.get_data()  # (n_epochs, n_ch, n_times)
+    n_epochs, n_ch, n_times = data.shape
+    data_concat = data.transpose(1, 0, 2).reshape(n_ch, -1)
+    raw = mne.io.RawArray(data_concat, epochs.info.copy())
+
+    epoch_duration = n_times / epochs.info['sfreq']
+    onsets = np.arange(n_epochs) * epoch_duration
+
+    # One span per epoch, described by its condition name (one colour per class)
+    id_to_label = {code: label for label, code in epochs.event_id.items()}
+    labels = [id_to_label.get(code, str(code)) for code in epochs.events[:, 2]]
+    annotations = mne.Annotations(onset=onsets,
+                                  duration=[epoch_duration] * n_epochs,
+                                  description=labels)
+
+    if mark_cue and epochs.tmin < 0:
+        annotations += mne.Annotations(onset=onsets - epochs.tmin,
+                                       duration=0.0,
+                                       description=cue_label)
+
+    raw.set_annotations(annotations)
+    return raw
+
+
+def make_figure_scrollable(fig, max_window=(1400, 900)):
+    """
+    Re-host a matplotlib figure's canvas inside a Qt scroll area.
+
+    Tall trellis figures (e.g. all ICA topographies at once) get squashed into the
+    window by the Qt backend. This keeps the canvas at its natural pixel size and
+    lets the window scroll over it instead.
+
+    No-op (returns ``fig`` unchanged) on non-Qt backends such as ``%matplotlib
+    inline``, where a tall figure already scrolls in the notebook output area.
+    """
+    try:
+        from matplotlib.backends.qt_compat import QtWidgets
+    except Exception:
+        return fig
+
+    try:
+        canvas = fig.canvas
+        window = getattr(getattr(canvas, 'manager', None), 'window', None)
+        if not isinstance(window, QtWidgets.QMainWindow):
+            return fig
+
+        width = int(fig.get_figwidth() * fig.dpi)
+        height = int(fig.get_figheight() * fig.dpi)
+
+        # Detach first: setCentralWidget() deletes the widget it replaces
+        canvas.setParent(None)
+        scroll = QtWidgets.QScrollArea(window)
+        scroll.setWidgetResizable(False)
+        scroll.setWidget(canvas)
+        window.setCentralWidget(scroll)
+        canvas.setFixedSize(width, height)
+        window.resize(min(width + 40, max_window[0]), min(height + 40, max_window[1]))
+    except Exception as err:
+        print(f"Could not make figure scrollable ({err}); showing it as-is.")
+    return fig
+
+
+def plot_ica_components_scrollable(ica, inst=None, show=True, **kwargs):
+    """
+    Plot all ICA topographies in a single scrollable figure.
+
+    ``ICA.plot_components()`` splits components into separate figures of 20; passing
+    an explicit ``picks`` keeps them in one figure, which is then made scrollable.
+
+    Parameters
+    ----------
+    ica : mne.preprocessing.ICA
+        Fitted ICA object.
+    inst : mne.io.Raw | mne.Epochs | None
+        Passed through to ``plot_components`` so that clicking a topography opens
+        ``ica.plot_properties`` for that component.
+    show : bool
+        Show the figure once it has been made scrollable.
+    **kwargs
+        Forwarded to ``ICA.plot_components``.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        The single figure holding every component.
+    """
+    from mne.viz.utils import plt_show
+
+    # Explicit picks bypasses MNE's "one figure per 20 components" behaviour
+    fig = ica.plot_components(picks=range(ica.n_components_), inst=inst,
+                              show=False, **kwargs)
+    make_figure_scrollable(fig)
+    plt_show(show)
+    return fig
+
+
+# ICLabel output classes, in the column order of ``ica.labels_scores_``
+# (see mne_icalabel.iclabel.iclabel_label_components)
+ICLABEL_CLASSES = ['brain', 'muscle artifact', 'eye blink', 'heart beat',
+                   'line noise', 'channel noise', 'other']
+
+
+def iclabel_suggested_exclusions(labels, exclude_labels):
+    """
+    Component indices whose ICLabel class is one of `exclude_labels`.
+
+    Parameters
+    ----------
+    labels : list of str
+        Per-component ICLabel class, i.e. ``label_dict['labels']``.
+    exclude_labels : list of str
+        ICLabel classes to flag, e.g. ``['eye blink', 'muscle artifact']``.
+
+    Returns
+    -------
+    list of int
+        Indices of components whose label is in `exclude_labels`.
+    """
+    unknown = [name for name in exclude_labels if name not in ICLABEL_CLASSES]
+    if unknown:
+        warnings.warn(f"{unknown} are not ICLabel classes and will never match. "
+                      f"Valid classes: {ICLABEL_CLASSES}")
+    return [idx for idx, label in enumerate(labels) if label in exclude_labels]
+
+
+def plot_iclabel_summary(ica, label_dict=None, proba=None, exclude=None, suggest=None,
+                         figsize=None, title=None, show=True):
+    """
+    Stacked bar of the full ICLabel probability distribution per component.
+
+    Shows the complete 7-class distribution rather than only the winning label, so a
+    component that is 51% brain / 49% muscle is distinguishable from one that is 99%
+    brain. Components are outlined in crimson when excluded and hatched when ICLabel
+    suggests excluding them, making disagreements between the two visible at a glance.
+
+    Parameters
+    ----------
+    ica : mne.preprocessing.ICA
+        ICA that has been through ``mne_icalabel.label_components``, which populates
+        ``ica.labels_scores_`` with the (n_components, 7) probability matrix.
+    label_dict : dict | None
+        Return value of ``label_components``; only ``'labels'`` is used. Derived from
+        `proba` when not given.
+    proba : array, shape (n_components, 7) | None
+        Probability matrix. Defaults to ``ica.labels_scores_``.
+    exclude : list of int | None
+        Components to outline in crimson. Defaults to ``ica.exclude``.
+    suggest : list of int | None
+        Components to hatch, e.g. the output of `iclabel_suggested_exclusions`.
+    figsize : tuple | None
+        Defaults to a width that scales with the number of components.
+    title : str | None
+        Overrides the auto-generated title.
+    show : bool
+        Show the figure.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    """
+    from matplotlib.patches import Patch, Rectangle
+    from mne.viz.utils import plt_show
+
+    if proba is None:
+        proba = getattr(ica, 'labels_scores_', None)
+    if proba is None:
+        raise RuntimeError(
+            "No ICLabel probabilities available. Run "
+            "`label_components(inst, ica, method='iclabel')` first (it populates "
+            "`ica.labels_scores_`), or pass `proba` explicitly.")
+    proba = np.asarray(proba)
+    if proba.ndim != 2 or proba.shape[1] != len(ICLABEL_CLASSES):
+        raise ValueError(f"Expected proba of shape (n_components, {len(ICLABEL_CLASSES)}), "
+                         f"got {proba.shape}.")
+
+    n_components = proba.shape[0]
+    if label_dict is not None:
+        labels = list(label_dict['labels'])
+    else:
+        labels = [ICLABEL_CLASSES[i] for i in proba.argmax(axis=1)]
+
+    exclude = sorted(set(ica.exclude if exclude is None else exclude))
+    suggest = sorted(set([] if suggest is None else suggest))
+
+    if figsize is None:
+        figsize = (max(10, 0.5 * n_components), 5.5)
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Stacked probability bars, one segment per ICLabel class
+    x = np.arange(n_components)
+    colors = plt.get_cmap('tab10').colors
+    bottom = np.zeros(n_components)
+    for cls_idx, cls_name in enumerate(ICLABEL_CLASSES):
+        ax.bar(x, proba[:, cls_idx], bottom=bottom, width=0.8,
+               color=colors[cls_idx], label=cls_name)
+        bottom += proba[:, cls_idx]
+
+    # Highlights drawn as overlays so a component can carry both styles at once
+    for idx in suggest:
+        ax.add_patch(Rectangle((idx - 0.4, 0), 0.8, 1.0, fill=False,
+                               edgecolor='0.3', linewidth=0.8, hatch='//', zorder=4))
+    for idx in exclude:
+        ax.add_patch(Rectangle((idx - 0.4, 0), 0.8, 1.0, fill=False,
+                               edgecolor='crimson', linewidth=2, zorder=5))
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"x{i}" if i in exclude else str(i) for i in x],
+                       fontsize=8 if n_components > 40 else 10)
+    ax.set_xlim(-0.7, n_components - 0.3)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel('component  (x = excluded, hatched = ICLabel suggestion)')
+    ax.set_ylabel('ICLabel probability')
+    ax.set_title(title if title is not None
+                 else _iclabel_title(n_components, labels, proba, exclude, suggest))
+
+    handles = [Patch(facecolor=colors[i], label=name)
+               for i, name in enumerate(ICLABEL_CLASSES)]
+    handles.append(Patch(facecolor='white', edgecolor='crimson', linewidth=2,
+                         label='excluded'))
+    handles.append(Patch(facecolor='white', edgecolor='0.3', hatch='//',
+                         label='ICLabel suggestion'))
+    ax.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, -0.12),
+              ncol=5, frameon=True)
+    fig.tight_layout()
+
+    # Very wide figures get squashed by the Qt backend; scroll them instead
+    if figsize[0] * fig.dpi > 1400:
+        make_figure_scrollable(fig)
+    plt_show(show)
+    return fig
+
+
+def _iclabel_title(n_components, labels, proba, exclude, suggest, max_listed=6):
+    """Build the summary title for `plot_iclabel_summary`."""
+    header = (f"ICLabel classification — {len(exclude)}/{n_components} components "
+              f"excluded, {n_components - len(exclude)} kept")
+    if exclude:
+        listed = [f"IC{i} {labels[i]} ({proba[i].max():.2f})" for i in exclude[:max_listed]]
+        header += " — " + ", ".join(listed)
+        if len(exclude) > max_listed:
+            header += f" (+{len(exclude) - max_listed} more)"
+
+    kept_but_suggested = [i for i in suggest if i not in exclude]
+    excluded_not_suggested = [i for i in exclude if i not in suggest]
+    disagreement = []
+    if kept_but_suggested:
+        disagreement.append("suggested but kept: "
+                            + ", ".join(f"IC{i}" for i in kept_but_suggested))
+    if suggest and excluded_not_suggested:
+        disagreement.append("excluded but not suggested: "
+                            + ", ".join(f"IC{i}" for i in excluded_not_suggested))
+    if disagreement:
+        header += "\n" + " · ".join(disagreement)
+    return header
+
 #%%
 def Load_and_concatenate_xdf(xdf_files, scale_to_mv=True):
     """
