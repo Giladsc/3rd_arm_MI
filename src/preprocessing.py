@@ -675,7 +675,142 @@ def get_subject_bad_electrodes(subject):
     else: 
         subject_bad_electrodes={}
         print('note that no bad electrodes were defined for the current subject:',subject)
-    return subject_bad_electrodes 
+    return subject_bad_electrodes
+#%%
+# ---------------------------------------------------------------------------
+# Montage + online-reference reconstruction.
+# Shared by the offline pipeline and the live-stream loop: both MUST run the
+# identical sequence or the model sees a different channel set online than it
+# was trained on. Do not inline a copy of this - call it.
+# ---------------------------------------------------------------------------
+REF_CHANNEL_NAME = 'FCz'   # the amplifier's online reference ('REF' in the .bvef)
+
+
+def load_montage(current_path, ref_channel=REF_CHANNEL_NAME):
+    """Read the CACS-64 montage, exposing the online reference as a real electrode.
+
+    The .bvef ships 66 entries: 'GND', 'REF' and the 64 recorded electrodes.
+    'REF' is the amplifier's online reference (Theta=23, Phi=90) i.e. FCz, and
+    read_custom_montage exposes it as an ordinary montage name. Renaming it to
+    ref_channel puts a usable position (0.0, 37.1, 87.4) mm - midway between Fz
+    and Cz, same y as FC1/FC2 - into the montage, so a reconstructed FCz channel
+    gets a real location from set_montage instead of NaN.
+
+    The montage file itself is left untouched. A fresh DigMontage is returned on
+    every call, so the rename can never mutate a montage held by a caller.
+    """
+    montage = mne.channels.read_custom_montage((f"{current_path}\Montages\CACS-64_REF.bvef"), head_size=0.095, coord_frame=None)
+    if 'REF' in montage.ch_names and ref_channel not in montage.ch_names:
+        montage.rename_channels({'REF': ref_channel})
+    return montage
+
+
+def apply_montage_and_reference(inst, montage, params_dict, ref_channel=REF_CHANNEL_NAME):
+    """Set the montage, optionally rebuild the online reference, drop bads, average-reference.
+
+    Enabled with params_dict['AddRefChannel'] = True (default False, i.e. the
+    historical behaviour). When on, the online reference is re-added as a data
+    channel: it starts as zeros, and the average reference then leaves it holding
+    -(sum of every other channel) == -(64/65) * mean(recorded channels), the
+    estimated potential at the reference site. Note this is the common-mode
+    estimate, not an independent measurement - against the full 64-channel set it
+    adds no information to a linear model. It adds real information only to a
+    channel *subset* (Electorde_Group), where it carries the aggregate of the
+    electrodes the subset excludes. Corollary: it is a good canary for an
+    unlisted bad electrode - if std(FCz)/std(Cz) >> 1, something is leaking into
+    the reference, and hence into every channel.
+
+    THE ORDER BELOW IS LOAD-BEARING. Do not reshuffle it:
+
+    1. add_reference_channels FIRST, while info['dig'] is still None. MNE
+       positions the new channel from an EEG dig point with ident==0; a
+       bvef-derived montage has none, so once set_montage has run the new
+       channel's loc is left NaN (silently - MNE 1.6 emits no catchable
+       warning), and compute_current_source_density later dies with
+       "Zero or infinite position found in chs". It also refuses to run at all
+       once an average-reference projection is active.
+    2. set_montage, which gives the new channel its real position.
+    3. Drop bad electrodes, so they cannot contaminate the average.
+    4. Average reference. This is per-time-sample and purely spatial, so the
+       result is bit-identical whether computed over a whole recording or a
+       55-sample live chunk - which is what lets the live loop match training
+       exactly, provided the channel SET here is the same.
+
+    Steps 2-4 are exactly the pre-existing block, so with 'AddRefChannel' absent
+    or False this function is a pure refactor.
+
+    Parameters
+    ----------
+    inst : instance of Raw
+        Preloaded, with non-EEG channels already dropped. Modified in place.
+    montage : DigMontage
+        As returned by load_montage (i.e. with ref_channel present).
+    params_dict : dict
+        Reads 'AddRefChannel' (default False), 'bad_electrodes', 'PerformAvgRef'.
+    ref_channel : str
+        Name of the online reference to reconstruct.
+
+    Returns
+    -------
+    inst : instance of Raw
+        The same (mutated) object, with ref_channel appended last if enabled.
+    elecs_to_drop : set of str
+        Bad electrodes that were actually present and dropped. Callers need this
+        to build the pick list - see select_electrodes.
+    """
+    bad_electrodes = set(params_dict.get('bad_electrodes') or [])
+    add_ref = params_dict.get('AddRefChannel', False)
+
+    if add_ref and not params_dict['PerformAvgRef']:
+        raise ValueError(
+            "AddRefChannel=True requires PerformAvgRef=True: without average "
+            f"referencing the reconstructed {ref_channel} stays all-zeros.")
+
+    if add_ref:
+        if ref_channel in bad_electrodes:
+            print(f'AddRefChannel is on but {ref_channel} is listed in bad_electrodes '
+                  f'- not reconstructing it.')
+        elif ref_channel in inst.ch_names:
+            #keep this idempotent: EEG_Preprocessing mutates the caller's raw in
+            #place, so re-running a cell must not raise.
+            print(f'{ref_channel} is already present - not adding it again.')
+        else:
+            inst = mne.add_reference_channels(inst, [ref_channel], copy=False)
+
+    inst.set_montage(montage, match_case=True, match_alias=False, on_missing='raise', verbose=None)
+
+    print('\n###########################################################')
+    print('removing subject specific bad electrodes from the raw data')
+    elecs_to_drop = set(inst.info['ch_names']).intersection(bad_electrodes)
+    if len(elecs_to_drop) > 0:
+        inst.drop_channels(list(elecs_to_drop))
+    inst.drop_channels(inst.info['bads'])
+
+    if (params_dict['PerformAvgRef']):
+        inst.set_eeg_reference(ref_channels="average")
+    return inst, elecs_to_drop
+
+
+def select_electrodes(inst, params_dict, elecs_to_drop, ref_channel=REF_CHANNEL_NAME):
+    """Build the pick list: Electorde_Group minus the dropped bad electrodes, in group order.
+
+    Also removes ref_channel when it is not in the data - the one legitimate
+    mismatch, e.g. a notebook that keeps 'FCz' in its electrode group while
+    running with AddRefChannel off, or a subject with FCz marked bad. Every
+    *other* missing name is deliberately left in, so that pick() still raises:
+    silently skipping absent electrodes is exactly how the offline and live
+    channel sets could drift apart unnoticed.
+
+    pick(names) honours the requested order, so the returned list defines the
+    channel order the classifier sees. It must be identical offline and live.
+    """
+    selected_elecs = [elec for elec in params_dict['Electorde_Group'] if elec not in elecs_to_drop]
+    if ref_channel in selected_elecs and ref_channel not in inst.ch_names:
+        print(f'{ref_channel} is in Electorde_Group but not in the data '
+              f'(AddRefChannel off?) - excluding it from the picks.')
+        selected_elecs = [elec for elec in selected_elecs if elec != ref_channel]
+    return selected_elecs
+#%%
 def raw_EEG_Preprocessing (current_path,raw, params_dict):
 
     #extract the current run paramaters: 
@@ -689,32 +824,18 @@ def raw_EEG_Preprocessing (current_path,raw, params_dict):
     #remove non existent channels: 
     if 'ACC_X' in Raw.ch_names:
         Raw.drop_channels(['ACC_X','ACC_Y','ACC_Z']) ## Drop non eeg channels
-    #set the correct (Brainvision Montage) montage:
-    montage = mne.channels.read_custom_montage((f"{current_path}\Montages\CACS-64_REF.bvef"), head_size=0.095, coord_frame=None) 
-    #rename channels for consistency (no longer required for future recordings): 
+    #rename channels for consistency (no longer required for future recordings):
     #mne.rename_channels(Raw.info, {'F9' : 'FT9','P9' : 'TP9','P10' : 'TP10','F10' : 'FT10','AF1' : 'AF7' }, allow_duplicates=False, verbose=None)
-    Raw.set_montage(montage, match_case=True, match_alias=False, on_missing='raise', verbose=None)
-
+    #set the montage, optionally rebuild the online reference (FCz), drop bad
+    #electrodes and average-reference - see apply_montage_and_reference, whose
+    #step order must not be reshuffled:
+    montage = load_montage(current_path)
+    Raw, elecs_to_drop = apply_montage_and_reference(Raw, montage, params_dict)
     print('\n###########################################################')
-    print('removing subject specific bad electrodes from the raw data')
-    #drop bad electrodes according to the current subject name: 
-    print('\n###########################################################')
-    print('removing bad channels from epochs:')
-    curr_elecs_in_epochs_set=set(Raw.info['ch_names'])
-    elecs_to_remove=params_dict['bad_electrodes']
-    elecs_to_drop=curr_elecs_in_epochs_set.intersection(elecs_to_remove)
-
-    if len(elecs_to_drop)>0: 
-        Raw.drop_channels(list(elecs_to_drop))
-    
-    Raw.drop_channels(Raw.info['bads'])
-    if (params_dict['PerformAvgRef']):
-        Raw.set_eeg_reference(ref_channels="average")
-    print('\n###########################################################')
-    print('filtering the data')  
+    print('filtering the data')
     unfiltered_Raw=Raw.copy()
     if (filter_method == 'iir'):
-        notched_Raw = unfiltered_Raw.filter(1,100, method=filter_method, phase='forward', pad=0)  
+        notched_Raw = unfiltered_Raw.filter(1,100, method=filter_method, phase='forward', pad=0)
         notched_Raw.notch_filter(50, method=filter_method, phase='forward') 
         if PerformCsd:
             notched_Raw = mne.preprocessing.compute_current_source_density(notched_Raw) # Perform current source density
@@ -910,32 +1031,19 @@ def EEG_Preprocessing (current_path,raw, params_dict, pick_channels=True):
     #remove non existent channels: 
     if 'ACC_X' in Raw.ch_names:
         Raw.drop_channels(['ACC_X','ACC_Y','ACC_Z']) ## Drop non eeg channels
-    #set the correct (Brainvision Montage) montage:
-    montage = mne.channels.read_custom_montage((f"{current_path}\Montages\CACS-64_REF.bvef"), head_size=0.095, coord_frame=None) 
-    #rename channels for consistency (no longer required for future recordings): 
+    #rename channels for consistency (no longer required for future recordings):
     #mne.rename_channels(Raw.info, {'F9' : 'FT9','P9' : 'TP9','P10' : 'TP10','F10' : 'FT10','AF1' : 'AF7' }, allow_duplicates=False, verbose=None)
-    Raw.set_montage(montage, match_case=True, match_alias=False, on_missing='raise', verbose=None)
-
+    #set the montage, optionally rebuild the online reference (FCz), drop bad
+    #electrodes and average-reference - see apply_montage_and_reference, whose
+    #step order must not be reshuffled:
+    montage = load_montage(current_path)
+    Raw, elecs_to_drop = apply_montage_and_reference(Raw, montage, params_dict)
+    selected_elecs = select_electrodes(Raw, params_dict, elecs_to_drop)
     print('\n###########################################################')
-    print('removing subject specific bad electrodes from the raw data')
-    #drop bad electrodes according to the current subject name: 
-    print('\n###########################################################')
-    print('removing bad channels from epochs:')
-    curr_elecs_in_epochs_set=set(Raw.info['ch_names'])
-    elecs_to_remove=params_dict['bad_electrodes']
-    elecs_to_drop=curr_elecs_in_epochs_set.intersection(elecs_to_remove)
-
-    if len(elecs_to_drop)>0: 
-        Raw.drop_channels(list(elecs_to_drop))
-    
-    Raw.drop_channels(Raw.info['bads'])
-    if (params_dict['PerformAvgRef']):
-        Raw.set_eeg_reference(ref_channels="average")
-    print('\n###########################################################')
-    print('filtering the data')  
+    print('filtering the data')
     unfiltered_Raw=Raw.copy()
     if (filter_method == 'iir'):
-        notched_Raw = unfiltered_Raw.filter(1, 100, method=filter_method, phase='forward', pad=0)  
+        notched_Raw = unfiltered_Raw.filter(1, 100, method=filter_method, phase='forward', pad=0)
         notched_Raw.notch_filter(50, method=filter_method, phase='forward') 
         if PerformCsd:
             notched_Raw = mne.preprocessing.compute_current_source_density(notched_Raw) # Perform current source density
@@ -967,11 +1075,11 @@ def EEG_Preprocessing (current_path,raw, params_dict, pick_channels=True):
 
     print('\n###########################################################')
     print('extracting event info:',event_dict)
-    
 
-    filtered_electrodes  = [elec for elec in params_dict['Electorde_Group'] if elec not in elecs_to_drop]
-    selected_elecs=filtered_electrodes
-    
+    #selected_elecs was already derived from the post-drop channel set above, by
+    #select_electrodes - do not recompute it here, or the offline pick list can
+    #drift from the live one.
+
     # Handle the case where there are NO events (e.g., pure idle file)
     if events_trigger_dict is None or len(events_trigger_dict) == 0:
         print("No events found in this recording. Returning filtered_raw only.")

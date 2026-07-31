@@ -77,6 +77,8 @@ XDF FILES
 │   • Filter & montage setup          │
 │   • ICA/Autoreject                  │
 │   • Re-reference (CSD/AvgRef)       │
+│     └ optional FCz reconstruction   │
+│       (params_dict['AddRefChannel'])│
 └────────────┬────────────────────────┘
              │
              ▼
@@ -191,6 +193,76 @@ Result Dict Structure:
 │ }                                  │
 └────────────────────────────────────┘
 ```
+
+## Reference Handling and the FCz Channel
+
+The amplifier records with **FCz as the online reference**, so FCz is a physical
+electrode but never appears in the XDF/LSL stream — the data carries only the 64
+differential channels. `Montages/CACS-64_REF.bvef` names that position `REF`
+(Theta=23, Phi=90).
+
+`params_dict['AddRefChannel']` (**default `False`**) reconstructs it. When enabled,
+FCz is re-added as a zero-filled channel *before* average referencing, so the
+average reference leaves it holding `-(sum of every other channel)`, i.e.
+`-(64/65) * mean(recorded channels)` — the estimated potential at the reference
+site. `FC+C+CP+P` then yields **30 channels instead of 29**.
+
+Three functions in `src/preprocessing.py` own this, and are called by **both** the
+offline pipeline and the live-stream loop so the two cannot drift:
+
+| Function | Role |
+|---|---|
+| `load_montage(current_path)` | Reads the .bvef and renames `REF` → `FCz`. The montage file itself is never modified. |
+| `apply_montage_and_reference(inst, montage, params_dict)` | montage + optional FCz reconstruction + bad-electrode drop + average reference. Returns `(inst, elecs_to_drop)`. |
+| `select_electrodes(inst, params_dict, elecs_to_drop)` | The pick list, single-sourced. Defines the channel *order* the classifier sees. |
+
+### The step order is load-bearing
+
+Inside `apply_montage_and_reference`: **`add_reference_channels` must run before
+`set_montage`, and both before the average reference.**
+
+- `add_reference_channels` refuses to run at all once an average-reference
+  projection is active.
+- It positions the new channel from an EEG dig point with `ident==0`. A
+  bvef-derived montage has none, so if `set_montage` has already run, FCz's
+  location is left **NaN** — silently, since MNE 1.6 emits no catchable warning.
+  You only discover it when `compute_current_source_density` dies with
+  `Zero or infinite position found in chs`.
+
+The regression check is therefore on the *location*, not on a warning: after
+preprocessing, `raw.info['chs'][idx]['loc'][:3]` for FCz must be finite and
+non-zero (it should be `(0, 37.1, 87.4)` mm).
+
+### Why this is safe online
+
+Average referencing is per-time-sample and purely spatial, so the reconstructed
+FCz is **bit-identical** whether computed over a whole recording or a 55-sample
+live chunk — verified against `BA_MI1.xdf` with `np.array_equal`. What must match
+between training and inference is the channel *set* at referencing time, which is
+exactly what calling the shared helper from both places guarantees.
+
+### Caveats
+
+- **FCz is not an independent measurement.** It is the common-mode estimate, so
+  against the *full* 64-channel set it adds no information to a linear model. It
+  adds real information only to a channel subset, where it carries the aggregate
+  of the electrodes the subset excludes.
+- **Rank.** After average referencing the 65-channel set is exactly rank 64
+  (`FCz = -Σ(others)`). Picking a 30-of-65 subset is generically full rank and
+  safe. Anything consuming the *full* set is not: `CSP(reg=None)`,
+  `Covariances(estimator='scm'|'lwf')`, ICA (pass `n_components ≤ 64`), and
+  `compute_covariance` (pass `rank='info'`).
+- **Artifact compatibility.** Existing `Models/*.joblib` and the `TFRs*/` caches
+  were built on 29 channels. Enabling the flag requires retraining, and model,
+  channel list and `params_dict` must be re-dumped **together** — the live
+  notebook loads all three from pickles and asserts they agree.
+- **ICA breaks the identity.** After component removal `FCz = -Σ(others)` no
+  longer holds unless the average reference is re-applied post-ICA. Keep the flag
+  off for the ICA path.
+
+Currently enabled only in `notebooks/Main_Experiment.ipynb`. `Main.ipynb`,
+`Main2.ipynb`, `Main_Experiment_ICA.ipynb`, `TFR_Analysis.ipynb` and
+`src/tfr_batch.py` do not set it and are bit-for-bit unaffected.
 
 ## Processing Pipeline Detail
 

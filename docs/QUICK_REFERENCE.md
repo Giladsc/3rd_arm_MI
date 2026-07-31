@@ -133,6 +133,25 @@ result = process_single_subject('SubjectName', 'pattern', params)
 | Memory errors | Reduce augmentation params or process fewer subjects |
 | Slow processing | Normal - takes 10-30 min per subject |
 | Missing files | Ensure Recordings/ folder exists with XDF files |
+| `Zero or infinite position found in chs` (CSD) | FCz has a NaN location: `set_montage` ran *before* `add_reference_channels`. See `apply_montage_and_reference` — that order is load-bearing. |
+| Live stream: `live channels != model channels` | The model was trained with a different `AddRefChannel` setting than the loaded `params_dict`. Re-dump model + picks + params_dict together. |
+| Group stacking fails on channel count | Some subjects at 29 channels, some at 30. Do not mix models trained with and without `AddRefChannel`. |
+
+## 🔌 FCz / online reference
+
+The amplifier's online reference (FCz) is not in the recorded data.
+`params_dict['AddRefChannel'] = True` rebuilds it as a real channel before average
+referencing, taking `FC+C+CP+P` from **29 to 30 channels**.
+
+```python
+params_dict['PerformAvgRef'] = True    # required
+params_dict['AddRefChannel'] = True    # default False everywhere else
+# and add 'FCz' to the 'FC' entry of Electorde_Groups
+```
+
+**Default is off**, so notebooks that don't set it — and every existing
+`Models/*.joblib` and `TFRs*/` cache — are bit-for-bit unaffected. Turning it on
+requires retraining. Full detail in [ARCHITECTURE.md](ARCHITECTURE.md#reference-handling-and-the-fcz-channel).
 
 ## 💡 Tips
 
