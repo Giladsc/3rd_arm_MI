@@ -668,7 +668,7 @@ def get_subject_bad_electrodes(subject):
                     'ID' : {'TP9','TP7'},
                     'LD' : {'TP10','FT8'},
                     'AEH' : {'T8','T7','TP9'},
-                    'BA' : {'T7','T8'}
+                    'BA' : {'T7','T8','TP9','TP10','FT10','FT9'}
                 }
     if subject in bad_elecs_dict.keys():
         subject_bad_electrodes=bad_elecs_dict[subject]
@@ -949,41 +949,48 @@ def Post_ICA_EEG_Preprocessing (current_path,raw, params_dict):
     
     #epochs.pick(selected_elecs)
     ## Centering the data
-
-    centered_data_list = []
-    events_list = []
+    #the grand mean is returned to the caller either way:
     mean_across_epochs = epochs.get_data().mean(axis=0)
-    # Loop through each event ID
-    for idx,event_id in enumerate(params_dict['desired_events']):
-        print (event_id)
-        # Extract epochs for the current event
-        event_epochs = epochs[event_id]
-        event_data = event_epochs.get_data()
-        
-        # Calculate the mean across epochs for the current event
-        mean_across_event_epochs = event_data.mean(axis=0)
-        
-        # Subtract the mean from each epoch of the current event
-        centered_event_data = event_data - mean_across_event_epochs
-        
-        # Store the centered data
-        centered_data_list.append(centered_event_data)
-        
-        # Prepare the events list and event_id_map for the combined EpochsArray
-        events_list.append(event_epochs.events)
 
-    # Concatenate all centered data and events
-    centered_data = np.concatenate(centered_data_list, axis=0)
-    combined_events = np.concatenate(events_list, axis=0)
+    #Per-class centering, controlled by params_dict['CenterByClass'] - read exactly as
+    #in EEG_Preprocessing (default True, the historical behaviour), so the two
+    #functions cannot drift apart. See that function for what the flag means.
+    if params_dict.get('CenterByClass', True):
+        centered_data_list = []
+        events_list = []
+        # Loop through each event ID
+        for idx,event_id in enumerate(params_dict['desired_events']):
+            print (event_id)
+            # Extract epochs for the current event
+            event_epochs = epochs[event_id]
+            event_data = event_epochs.get_data()
 
-    # Sort the combined events based on their original occurrence time to preserve the temporal sequence
-    sort_indices = np.argsort(combined_events[:, 0])
-    combined_events = combined_events[sort_indices]
-    centered_data = centered_data[sort_indices]
+            # Calculate the mean across epochs for the current event
+            mean_across_event_epochs = event_data.mean(axis=0)
 
-    # Create a new EpochsArray with the centered data
-    centered_epochs = mne.EpochsArray(centered_data, epochs.info, events=combined_events, event_id=epochs.event_id, tmin=epochs.tmin)
-    epochs = centered_epochs
+            # Subtract the mean from each epoch of the current event
+            centered_event_data = event_data - mean_across_event_epochs
+
+            # Store the centered data
+            centered_data_list.append(centered_event_data)
+
+            # Prepare the events list and event_id_map for the combined EpochsArray
+            events_list.append(event_epochs.events)
+
+        # Concatenate all centered data and events
+        centered_data = np.concatenate(centered_data_list, axis=0)
+        combined_events = np.concatenate(events_list, axis=0)
+
+        # Sort the combined events based on their original occurrence time to preserve the temporal sequence
+        sort_indices = np.argsort(combined_events[:, 0])
+        combined_events = combined_events[sort_indices]
+        centered_data = centered_data[sort_indices]
+
+        # Create a new EpochsArray with the centered data
+        centered_epochs = mne.EpochsArray(centered_data, epochs.info, events=combined_events, event_id=epochs.event_id, tmin=epochs.tmin)
+        epochs = centered_epochs
+    else:
+        print('CenterByClass is off - leaving the per-class evoked response in the data.')
 
     #this section drops electrodes after epoching: but currently we drop all bad electrodes from the raw data
     print('\n###########################################################')
@@ -1134,41 +1141,61 @@ def EEG_Preprocessing (current_path,raw, params_dict, pick_channels=True):
     if pick_channels:
         epochs.pick(selected_elecs)
     ## Centering the data
-
-    centered_data_list = []
-    events_list = []
+    #the grand mean is returned to the caller either way:
     mean_across_epochs = epochs.get_data().mean(axis=0)
-    # Loop through each event ID
-    for idx,event_id in enumerate(params_dict['desired_events']):
-        print (event_id)
-        # Extract epochs for the current event
-        event_epochs = epochs[event_id]
-        event_data = event_epochs.get_data()
-        
-        # Calculate the mean across epochs for the current event
-        mean_across_event_epochs = event_data.mean(axis=0)
-        
-        # Subtract the mean from each epoch of the current event
-        centered_event_data = event_data - mean_across_event_epochs
-        
-        # Store the centered data
-        centered_data_list.append(centered_event_data)
-        
-        # Prepare the events list and event_id_map for the combined EpochsArray
-        events_list.append(event_epochs.events)
 
-    # Concatenate all centered data and events
-    centered_data = np.concatenate(centered_data_list, axis=0)
-    combined_events = np.concatenate(events_list, axis=0)
+    #Per-class centering, controlled by params_dict['CenterByClass'] (default True,
+    #i.e. the historical behaviour - so every existing caller is unaffected).
+    #
+    #WHAT IT DOES: subtracts from each epoch the mean of all epochs of that epoch's
+    #own class, computed per recording file (~27 trials/class/file).
+    #
+    #WHY YOU MAY WANT IT OFF: this is a LABEL-DEPENDENT transform - you must already
+    #know a trial's class to centre it - so it cannot be applied to an unlabelled
+    #trial. The live loop does not apply it (the mean subtraction in
+    #Live_Stream.ipynb is commented out and the saved mean-* artifact is unused), so
+    #a model trained with this on is served data online that was never centred. It
+    #also removes the per-class evoked response, making everything downstream
+    #induced power. src/windowed_batch.py, src/full_epoch_batch.py and
+    #src/session_batch.py measure both settings: the centered/uncentered epoch
+    #variants are EPOCH_VARIANTS in src/analysis_common.py, and each of those three
+    #modules pairs them into its own <train>2<test> MODES (c2c, c2u, ...).
+    if params_dict.get('CenterByClass', True):
+        centered_data_list = []
+        events_list = []
+        # Loop through each event ID
+        for idx,event_id in enumerate(params_dict['desired_events']):
+            print (event_id)
+            # Extract epochs for the current event
+            event_epochs = epochs[event_id]
+            event_data = event_epochs.get_data()
 
-    # Sort the combined events based on their original occurrence time to preserve the temporal sequence
-    sort_indices = np.argsort(combined_events[:, 0])
-    combined_events = combined_events[sort_indices]
-    centered_data = centered_data[sort_indices]
+            # Calculate the mean across epochs for the current event
+            mean_across_event_epochs = event_data.mean(axis=0)
 
-    # Create a new EpochsArray with the centered data
-    centered_epochs = mne.EpochsArray(centered_data, epochs.info, events=combined_events, event_id=epochs.event_id, tmin=epochs.tmin)
-    epochs = centered_epochs
+            # Subtract the mean from each epoch of the current event
+            centered_event_data = event_data - mean_across_event_epochs
+
+            # Store the centered data
+            centered_data_list.append(centered_event_data)
+
+            # Prepare the events list and event_id_map for the combined EpochsArray
+            events_list.append(event_epochs.events)
+
+        # Concatenate all centered data and events
+        centered_data = np.concatenate(centered_data_list, axis=0)
+        combined_events = np.concatenate(events_list, axis=0)
+
+        # Sort the combined events based on their original occurrence time to preserve the temporal sequence
+        sort_indices = np.argsort(combined_events[:, 0])
+        combined_events = combined_events[sort_indices]
+        centered_data = centered_data[sort_indices]
+
+        # Create a new EpochsArray with the centered data
+        centered_epochs = mne.EpochsArray(centered_data, epochs.info, events=combined_events, event_id=epochs.event_id, tmin=epochs.tmin)
+        epochs = centered_epochs
+    else:
+        print('CenterByClass is off - leaving the per-class evoked response in the data.')
 
     #this section drops electrodes after epoching: but currently we drop all bad electrodes from the raw data
     print('\n###########################################################')

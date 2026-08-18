@@ -153,6 +153,34 @@ params_dict['AddRefChannel'] = True    # default False everywhere else
 `Models/*.joblib` and `TFRs*/` cache — are bit-for-bit unaffected. Turning it on
 requires retraining. Full detail in [ARCHITECTURE.md](ARCHITECTURE.md#reference-handling-and-the-fcz-channel).
 
+## 🎯 Per-class centering (`CenterByClass`)
+
+```python
+params_dict['CenterByClass'] = True    # default; the historical behaviour
+```
+
+`EEG_Preprocessing` subtracts from each epoch the mean of all epochs of **that
+epoch's own class**, computed per XDF file. It is **label-dependent** — you must
+know a trial's class to centre it — so the live loop cannot apply it, and a model
+trained with it on is served uncentered data online. It also removes the per-class
+evoked response, which is what makes everything downstream *induced* power.
+
+Set it to `False` to leave the evoked response in. The benchmark stack
+(`Windowed_`/`Session_`/`Full_Epoch_Analysis.ipynb`) ignores the value in its params
+cell: it builds **both** a centered and an uncentered copy of every subject's epochs
+and pairs them into `<train>2<test>` modes, which is where the cost of this transform
+at inference time is measured. Each notebook runs its own set:
+
+| notebook | modes |
+|---|---|
+| `Windowed_Analysis` | `c2c`, `c2u`, `u2c`, `u2u` — the full 2×2 train/test matrix |
+| `Session_Analysis` | `c2c`, `c2u`, `u2u` — `c2u` is the leak-free one under the `cross` split |
+| `Full_Epoch_Analysis` | `c2c` only by default; `DIAGNOSTIC_MODES` adds `g2g`/`g2u`/`l2l`/`l2u`/`c2u`/`u2u` |
+
+The letter is the centering recipe each side used: `c` = class means per XDF file
+(what `CenterByClass=True` produces), `g` = global pooled over the subject,
+`l` = fold-local (training trials only), `u` = not centered.
+
 ## 💡 Tips
 
 - Use `verbose=True` for detailed processing output

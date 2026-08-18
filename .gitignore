@@ -13,6 +13,18 @@ hyper_param_search_outputs/
 # Rebuildable pre-ICA epochs and fitted ICA (see src/tfr_batch.py)
 Cache/
 
+# Multi-subject benchmark (see src/benchmark_batch.py). Everything here is
+# rebuildable by re-running run_benchmark_batch(); only the two small
+# benchmark_summary.* files, which carry the run's provenance, are committed.
+# Batch analyses (src/windowed_batch.py, src/full_epoch_batch.py). Layout is
+# Analysis/<label>/{Cache,Windowed,FullEpoch}/ where <label> is the class set, so
+# each desired_events configuration keeps its own tree and the two analyses share
+# one epoch cache. Only the small *_summary.{csv,json} and permutation_*.json
+# files are committed; everything else is rebuildable.
+Analysis/*/Cache/
+Analysis/*/*/Figures/
+Analysis/*/*/Metrics/
+
 # Scratch/temp files
 foo.csv
 return_df.csv
