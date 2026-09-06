@@ -12,6 +12,14 @@ src/tfr_batch.py and produces the across-subject descriptive figures:
            rows = bands, columns = conditions, grand average only
         -> Figures/Group/GrandAverage/<event>_{topo,joint,bands}.png
         -> Figures/Group/Contrasts/<cond1>_minus_<cond2>_joint.png
+        -> Figures/Group/TimeBins/<band>_time_grid.png
+           rows = conditions, columns = consecutive time bins, on a true PERCENT scale;
+           the arithmetic mean of the subjects' percent change
+        -> Figures/Group/TimeBins/<band>_time_grid_geomean.png
+           the same grid, geometric mean of the subjects' power ratios
+        -> Figures/Group/TimeBins/<band>_time_animation[_geomean].html
+           the same sweep as a playable animation (play / pause / scrub), group only
+        -> Figures/<subject>/TimeBins/<band>_time_grid.png  (the same, per subject)
         -> Figures/Group/tfr_group_summary.json   (cohort + config provenance)
 
 The cohort is whoever has been ICA-reviewed and has a full set of current-pipeline TFRs,
@@ -33,9 +41,11 @@ from types import SimpleNamespace
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.animation import FuncAnimation
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 from mne.time_frequency import read_tfrs
+from mne.utils import use_log_level
 
 # Settings arrive as the tfr_params dict, never as imported constants. `from ... import
 # BANDS` would bind a SECOND module global here, so a notebook that rebound
@@ -52,6 +62,8 @@ from .tfr_batch import (  # noqa: F401  (default_params/default_tfr_params re-ex
     load_ica_exclusions,
     mode_label,
     project_paths,
+    resolve_n_cycles,
+    subject_figure_dir,
 )
 
 #%%
@@ -61,7 +73,7 @@ from .tfr_batch import (  # noqa: F401  (default_params/default_tfr_params re-ex
 
 
 def group_figure_dir(kind, paths=None):
-    """``Figures/Group/<kind>/``, created on demand. kind: 'Subjects'|'GrandAverage'|'Contrasts'."""
+    """``Figures/Group/<kind>/``, created on demand. kind: 'Subjects'|'GrandAverage'|'Contrasts'|'TimeBins'."""
     paths = paths or project_paths()
     out_dir = paths.figures / 'Group' / kind
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -508,6 +520,520 @@ def save_group_contrast_figures(group, grand, out_dir, paths=None, tfr_params=No
 
 #%%
 # ============================================================
+# Time-binned topomap grid (stage 4b)
+# ============================================================
+
+# How to get from each apply_baseline mode back to the POWER RATIO, P / P_baseline.
+#
+# Everything the binned grid reports is derived from this ratio rather than from the
+# stored numbers directly, which is what makes the figure independent of which tree it is
+# run on: logratio, percent and ratio are three encodings of the same quantity, so all
+# three must produce an identical grid. They did not always - the percent scale used to be
+# reached by a per-mode formula, and the group mean it produced depended on which tree was
+# canonical. Going through the ratio removes that coupling.
+#
+# MNE's mode='percent' is a FRACTION - (power - baseline) / baseline - which is why
+# tfr_batch.BASELINE_MODE_LABELS calls it 'fractional change' and why it needs the +1 here
+# and a 100x later. The modes that are absent are absent on purpose: 'mean' is an
+# unnormalised power difference and the z-scores are in standard deviations, so neither is
+# a ratio to the baseline and neither has a percent change to be recovered from it.
+_RATIO_FROM_MODE = {
+    'logratio': lambda data: 10.0 ** data,
+    'percent': lambda data: 1.0 + data,
+    'ratio': lambda data: data,
+}
+
+# Power is non-negative, so a percent-mode ratio is >= 0 and can be exactly 0 (a channel
+# whose band power vanished). log(0) is -inf, which would propagate through the geometric
+# mean and paint a whole topomap blank. Clip to something far below any real ERD - a
+# ratio of 1e-12 is a 100% decrease to twelve decimal places - so the floor can never be
+# mistaken for a measurement.
+_RATIO_FLOOR = 1e-12
+
+
+def to_ratio(tfr, tfr_params):
+    """
+    A copy of ``tfr`` with its data as the power ratio ``P / P_baseline``.
+
+    The common currency for every percent-scale figure here: 1.0 is no change, 0.5 is a
+    50% ERD, 2.0 is a doubling.
+    """
+    mode = tfr_params['mode']
+    if mode not in _RATIO_FROM_MODE:
+        raise ValueError(
+            f"mode {mode!r} is not a ratio to the baseline, so no percent change can be "
+            f"recovered from it. Re-run the TFRs with one of "
+            f"{sorted(_RATIO_FROM_MODE)}, or read the binned grid in native units.")
+    converted = tfr.copy()
+    converted.data = _RATIO_FROM_MODE[mode](tfr.data)
+    return converted
+
+
+def to_percent_change(tfr, tfr_params):
+    """
+    A copy of ``tfr`` with its data rescaled to percent change from baseline.
+
+    Negative is ERD (a power decrease) and positive is ERS, which is the sign convention
+    the ``RdBu_r`` colormap already carries everywhere else here: blue is a decrease.
+    """
+    converted = to_ratio(tfr, tfr_params)
+    converted.data = (converted.data - 1.0) * 100.0
+    return converted
+
+
+def percent_group(group, tfr_params):
+    """
+    The cohort on a percent scale, averaged ARITHMETICALLY: ``(pct_by_subject, pct_grand)``.
+
+    Every subject is converted to percent first and the grand average is then built from
+    the converted data, so ``pct_grand`` is the mean percent change - which is what a
+    colorbar reading '%' is taken to mean, and the Pfurtscheller convention.
+
+    This is deliberately not ``grand_average_tfrs`` followed by a conversion. That would
+    average in whatever scale the tree happens to be stored in, so the same cohort would
+    give a different answer on the logratio tree (a geometric mean) than on the percent
+    tree (this one). See ``geometric_percent_grand`` for the other mean, computed
+    explicitly rather than fallen into.
+
+    The subject average stays equally weighted, for the reason in ``grand_average_tfrs``.
+    """
+    pct_by_subject = {
+        subject: {event: to_percent_change(tfr, tfr_params)
+                  for event, tfr in by_event.items()}
+        for subject, by_event in group.by_subject.items()
+    }
+    pct_grand = {}
+    for event in group.events:
+        stack = [pct_by_subject[s][event] for s in group.subjects]
+        averaged = stack[0].copy()
+        averaged.data = np.stack([tfr.data for tfr in stack], axis=0).mean(axis=0)
+        averaged.nave = len(stack)
+        pct_grand[event] = averaged
+    return pct_by_subject, pct_grand
+
+
+def geometric_percent_grand(group, tfr_params):
+    """
+    The cohort on a percent scale, averaged GEOMETRICALLY: ``{event: AverageTFR}``.
+
+    ``exp(mean_s(log(P_s / P_base_s))) - 1``, i.e. the geometric mean of the subjects'
+    power ratios expressed as a percent change. Power ratios are multiplicative and
+    right-skewed, so this damps a single extreme subject in a way the arithmetic mean does
+    not; it is also how every other stage-4 figure averages, since they average the stored
+    logratio data.
+
+    Note what this takes: ``group``, not ``grand``. Converting ``grand`` is the obvious
+    implementation and is right on exactly one of the two trees. ``grand_average_tfrs``
+    averages whatever is stored, so on the logratio tree that is already a geometric mean
+    and converting it works - but on the percent tree it is an ARITHMETIC mean, and
+    converting it would return a second copy of ``percent_group``'s answer under a label
+    saying 'geometric'. Recomputing from the per-subject ratios is correct on both.
+    """
+    geo = {}
+    for event in group.events:
+        ratios = np.stack(
+            [to_ratio(group.by_subject[s][event], tfr_params).data
+             for s in group.subjects], axis=0)
+        mean_log = np.log(np.clip(ratios, _RATIO_FLOOR, None)).mean(axis=0)
+        averaged = group.by_subject[group.subjects[0]][event].copy()
+        averaged.data = (np.exp(mean_log) - 1.0) * 100.0
+        averaged.nave = len(group.subjects)
+        geo[event] = averaged
+    return geo
+
+
+def time_bin_edges(tfr_params, step=None):
+    """
+    ``[(t0, t1), ...]`` tiling ``time_grid_window`` exactly, at ``step`` seconds.
+
+    ``step`` defaults to ``time_grid_step`` (the static grid's columns); the animation
+    passes ``time_anim_step`` to get its finer frames off the same arithmetic, so the two
+    cannot disagree about where a bin starts.
+
+    Built by multiplying out the step rather than by ``np.arange``, whose accumulated
+    float error at 0.2 s puts the last edge a hair past the window and can add a
+    twenty-sixth, empty column.
+    """
+    start, end = tfr_params['time_grid_window']
+    step = tfr_params['time_grid_step'] if step is None else step
+    n_bins = int(round((end - start) / step))
+    return [(start + i * step, start + (i + 1) * step) for i in range(n_bins)]
+
+
+def _half_open(bins, tfr):
+    """
+    ``[(t0, t1), ...]`` shifted so each bin claims exactly the samples in ``[t0, t1)``.
+
+    Both ``band_map`` and MNE's own time selection take ``tmin <= t <= tmax``, so
+    contiguous bins would each claim the sample they share: every column would average 11
+    samples instead of 10, with each boundary sample counted twice across the figure.
+
+    Both edges move back by a QUARTER of a sample, not the right edge back by half. Half
+    a sample is the arithmetically obvious shift and it silently loses samples, because
+    it leaves each bin's left edge sitting exactly on one: the time vector carries float
+    error - 0.2 s comes back as 0.19999999999999998 - so ``t >= 0.2`` rejects the very
+    sample the bin was defined to start at, and the previous bin has already ended below
+    it. That drops it from both, which showed up as columns averaging 9 samples instead
+    of 10. A quarter-sample guard puts every edge a safe distance from any sample, so
+    which bin a sample falls in is decided by the bins and not by the last bit of a float.
+    """
+    guard = float(np.diff(tfr.times).mean()) / 4
+    return [(t0 - guard, t1 - guard) for t0, t1 in bins]
+
+
+def time_grid_values(tfrs, band_name, tfr_params, step=None):
+    """Every cell of one binned grid, ``{event: [per-bin channel map]}``."""
+    fmin, fmax = tfr_params['bands'][band_name]
+    bins = _half_open(time_bin_edges(tfr_params, step), next(iter(tfrs.values())))
+    return {event: [band_map(tfr, fmin, fmax, t0, t1) for t0, t1 in bins]
+            for event, tfr in tfrs.items()}
+
+
+def time_scale_for_band(band_name, group_tfrs, tfr_params, by_subject=None):
+    """
+    The one symmetric colour scale every TimeBins artefact for a band shares.
+
+    Pooled over BOTH bin schemes - the static grid's ``time_grid_step`` cells and the
+    animation's finer ``time_anim_step`` frames - and over the per-subject grids when they
+    are being written. Pooling both schemes is not fussiness: a narrower frame averages
+    fewer samples and so reaches further into the tails, and a limit taken from the 0.2 s
+    grid alone would clip the animation at exactly the moments it exists to show.
+
+    ``group_tfrs`` is the list of group-level ``{event: AverageTFR}`` dicts to cover
+    (arithmetic and geometric).
+    """
+    steps = [tfr_params['time_grid_step']]
+    if tfr_params['time_anim_enabled']:
+        steps.append(tfr_params['time_anim_step'])
+
+    pooled = []
+    for tfrs in group_tfrs:
+        for step in steps:
+            pooled += [v for maps in time_grid_values(tfrs, band_name, tfr_params,
+                                                      step).values() for v in maps]
+    for tfrs in (by_subject or {}).values():
+        pooled += [v for maps in time_grid_values(tfrs, band_name,
+                                                  tfr_params).values() for v in maps]
+    return _shared_vlim(np.concatenate(pooled), pct=tfr_params['autoscale_pct'])
+
+
+def save_time_binned_topomap_grid(tfrs, band_name, out_dir, filename, title,
+                                  vlim=None, paths=None, tfr_params=None):
+    """
+    Rows = conditions, columns = consecutive time bins: where the ERD is, and when.
+
+    The counterpart of ``save_grand_average_panel``, which collapses the whole
+    ``active_window`` into one topomap per condition and so cannot show a time course at
+    all. ``tfrs`` must already be on a percent scale (see ``to_percent_change``).
+
+    The bins wrap into stacked blocks of ``tfr_params['time_grid_cols']`` columns, since
+    twenty topomaps in a row is a figure nothing can be read off on screen. Every block
+    carries its own time axis, and all of them share ONE symmetric colour scale - passed
+    in as ``vlim`` when a set of figures has to be comparable, otherwise autoscaled to
+    this figure at ``autoscale_pct``. Per-cell autoscaling would make a bin at 2% render
+    identically to one at 40%, which would destroy the only thing the layout is for.
+
+    Note the columns are not independent measurements: the analysis window is
+    ``n_cycles / freq`` seconds long, typically several times the bin width, so adjacent
+    columns are built from largely the same data. The suptitle states the overlap.
+    """
+    tfr_params = tfr_params or default_tfr_params()
+    fmin, fmax = tfr_params['bands'][band_name]
+    events = list(tfrs)
+    bins = time_bin_edges(tfr_params)
+    drawn = _half_open(bins, next(iter(tfrs.values())))
+    step = tfr_params['time_grid_step']
+    cols = min(tfr_params['time_grid_cols'], len(bins))
+    n_blocks = int(np.ceil(len(bins) / cols))
+
+    if vlim is None:
+        values = time_grid_values(tfrs, band_name, tfr_params)
+        vlim = _shared_vlim(np.concatenate([v for maps in values.values() for v in maps]),
+                            pct=tfr_params['autoscale_pct'])
+
+    # A hand-placed gridspec plus a hand-placed colorbar axes, rather than
+    # fig.colorbar(ax=[...]) as the other group figures use: that call reflows every axes
+    # it is given, which would slide the topomap columns out from under the time axes
+    # drawn to line up with them.
+    # Nested gridspecs, not one flat grid of every row: the time axis hangs its tick
+    # labels and its 'Time (s)' below its own cell, which in a flat grid is the next
+    # block's first row of topomaps and collides with them. An outer grid of blocks with
+    # its own hspace puts real space between the blocks for those labels to live in.
+    row_h, cell_w, axis_h = 1.55, 1.5, 0.5
+    fig = plt.figure(figsize=(cell_w * cols + 2.6,
+                              n_blocks * (row_h * len(events) + axis_h) + 1.4))
+    outer = fig.add_gridspec(n_blocks, 1, left=0.13, right=0.86, top=0.90, bottom=0.05,
+                             hspace=0.22)
+
+    # plot_topomap logs "No baseline correction applied" once per call because it is
+    # passed baseline=None - one line per cell, so 80 per figure and a couple of
+    # thousand for a full run. It takes no `verbose` of its own in MNE 1.6, hence the
+    # log level rather than a keyword. The TFRs were baselined in stage 3; there is
+    # nothing to report.
+    with use_log_level('ERROR'):
+        for block in range(n_blocks):
+            block_bins = list(range(block * cols, min((block + 1) * cols, len(bins))))
+            gs = outer[block].subgridspec(
+                len(events) + 1, cols, hspace=0.05, wspace=0.02,
+                height_ratios=[row_h] * len(events) + [axis_h])
+            for row, event in enumerate(events):
+                for col, index in enumerate(block_bins):
+                    ax = fig.add_subplot(gs[row, col])
+                    t0, t1 = drawn[index]
+                    tfrs[event].plot_topomap(
+                        tmin=t0, tmax=t1,
+                        fmin=fmin, fmax=fmax,
+                        baseline=None, mode=None,
+                        vlim=vlim, cmap=tfr_params['cmap'],
+                        sensors=False,
+                        axes=ax, show=False, colorbar=False,
+                    )
+                    if col == 0:
+                        ax.annotate(event, xy=(-0.15, 0.5), xycoords='axes fraction',
+                                    fontsize=11, fontweight='bold', ha='right', va='center')
+
+            # Time axis under the block, spanning the same columns the topomaps sit in, so a
+            # tick falls exactly on each bin boundary.
+            axis = fig.add_subplot(gs[len(events), :len(block_bins)])
+            start = bins[block_bins[0]][0]
+            axis.set_xlim(start, bins[block_bins[-1]][1])
+            ticks = [start + i * step for i in range(len(block_bins) + 1)]
+            axis.set_xticks(ticks)
+            axis.set_xticklabels([f'{t:g}' for t in ticks], fontsize=9)
+            axis.set_yticks([])
+            for side in ('top', 'left', 'right'):
+                axis.spines[side].set_visible(False)
+            axis.set_xlabel('Time (s)', fontsize=11, fontweight='bold', labelpad=2)
+
+    cax = fig.add_axes([0.885, 0.30, 0.016, 0.40])
+    sm = ScalarMappable(norm=Normalize(vmin=vlim[0], vmax=vlim[1]),
+                        cmap=tfr_params['cmap'])
+    sm.set_array([])
+    cbar = fig.colorbar(sm, cax=cax)
+    cbar.set_label('ERD / ERS  (%)', fontsize=11)
+
+    longest = float((resolve_n_cycles(tfr_params) / np.asarray(
+        tfr_params['freqs'], dtype=float)).max())
+    overlap = max(0.0, 100 * (1 - step / longest))
+    fig.suptitle(
+        f'{title}\n{band_name} band ({fmin}-{fmax} Hz), {step:g} s bins over '
+        f'{bins[0][0]:g}-{bins[-1][1]:g} s  -  {longest:.2f} s analysis window, so '
+        f'adjacent columns overlap ~{overlap:.0f}%',
+        fontsize=13, fontweight='bold')
+
+    path = _savefig(fig, out_dir / filename, paths, tfr_params)
+    plt.close(fig)
+    return path
+
+
+def save_group_time_grids(group, grand, out_dir, paths=None, tfr_params=None):
+    """
+    The binned grid for every band: both group means, and optionally each subject.
+
+    Two group figures per band, because the two ways of averaging percent change across
+    subjects are different quantities and the difference is worth seeing rather than
+    assuming:
+
+        <band>_time_grid.png          arithmetic mean of the subjects' percent change
+        <band>_time_grid_geomean.png  geometric mean of the subjects' power ratios
+
+    They are pooled into ONE colour scale, together with the per-subject grids. Letting
+    each scale to itself is the obvious default and would defeat the point: the arithmetic
+    mean's sensitivity to an extreme subject is visible only when both are drawn against
+    the same limits. It is the same argument ``save_subject_band_grid`` makes for keeping
+    subjects and the group on one scale.
+
+    ``grand`` is accepted and deliberately not used. Both means are computed from
+    ``group``, because ``grand`` averages whatever scale the tree is stored in and so
+    means different things on the logratio and percent trees - see
+    ``geometric_percent_grand``. It stays in the signature so this reads like every other
+    figure function here and drops straight into ``run_tfr_group``'s step list.
+    """
+    tfr_params = tfr_params or default_tfr_params()
+    pct_by_subject, pct_grand = percent_group(group, tfr_params)
+    geo_grand = geometric_percent_grand(group, tfr_params)
+    per_subject = tfr_params['time_grid_per_subject']
+    n_subj = len(group.subjects)
+    written = []
+
+    for band_name in tfr_params['bands']:
+        vlim = time_scale_for_band(
+            band_name, [pct_grand, geo_grand], tfr_params,
+            by_subject=pct_by_subject if per_subject else None)
+
+        for tfrs, filename, mean_name in (
+                (pct_grand, f'{band_name}_time_grid.png',
+                 "arithmetic mean of the subjects' ERD%"),
+                (geo_grand, f'{band_name}_time_grid_geomean.png',
+                 "geometric mean of the subjects' power ratios")):
+            written.append(save_time_binned_topomap_grid(
+                tfrs, band_name, out_dir, filename,
+                f'Grand average ERD / ERS over time (N={n_subj}) - {mean_name}',
+                vlim=vlim, paths=paths, tfr_params=tfr_params))
+
+        if per_subject:
+            for subject in group.subjects:
+                written.append(save_time_binned_topomap_grid(
+                    pct_by_subject[subject], band_name,
+                    subject_figure_dir(subject, 'TimeBins', paths),
+                    f'{band_name}_time_grid.png',
+                    f'{subject} - ERD / ERS over time '
+                    f'(shared scale with the N={n_subj} group grids)',
+                    vlim=vlim, paths=paths, tfr_params=tfr_params))
+
+    return written
+
+
+#%%
+# ============================================================
+# Time animation (stage 4b, playable)
+# ============================================================
+
+
+def build_time_animation(tfrs, band_name, title, vlim, tfr_params=None):
+    """
+    The binned grid as a playable sweep: ``(fig, anim)``.
+
+    One topomap per condition, redrawn as the window steps through
+    ``time_grid_window``, with a cursor tracking the position on a time axis underneath.
+    The static grid shows every moment at once and is the one to read side by side; this
+    is the one for watching a pattern arrive and go, which a grid of 25 small circles
+    makes surprisingly hard.
+
+    Each frame is drawn by the same ``plot_topomap`` call the grid uses, at the same
+    ``vlim``, off bins from the same ``time_bin_edges`` arithmetic - so a frame and the
+    grid cell covering it cannot drift apart in appearance or in which samples they average.
+
+    ``tfrs`` must already be on a percent scale. Returns the animation rather than saving
+    it, so a notebook can hand it straight to ``IPython.display.HTML(anim.to_jshtml())``
+    without a file round trip.
+    """
+    tfr_params = tfr_params or default_tfr_params()
+    fmin, fmax = tfr_params['bands'][band_name]
+    events = list(tfrs)
+    step = tfr_params['time_anim_step']
+    bins = time_bin_edges(tfr_params, step)
+    drawn = _half_open(bins, next(iter(tfrs.values())))
+    start, end = tfr_params['time_grid_window']
+
+    fig = plt.figure(figsize=(3.1 * len(events) + 1.8, 4.4),
+                     dpi=tfr_params['time_anim_dpi'])
+    gs = fig.add_gridspec(2, len(events), left=0.03, right=0.88, top=0.80, bottom=0.13,
+                          hspace=0.10, wspace=0.02, height_ratios=[1.0, 0.16])
+    axes = [fig.add_subplot(gs[0, i]) for i in range(len(events))]
+
+    # The cursor axis spans the whole window, so the marker's position is the fraction of
+    # the trial elapsed - the thing a viewer needs while the topomaps are changing.
+    cursor_ax = fig.add_subplot(gs[1, :])
+    cursor_ax.set_xlim(start, end)
+    cursor_ax.set_ylim(0, 1)
+    cursor_ax.set_yticks([])
+    cursor_ax.set_xticks(np.arange(start, end + 1e-9, 0.5))
+    cursor_ax.set_xticklabels([f'{t:g}' for t in np.arange(start, end + 1e-9, 0.5)],
+                              fontsize=8)
+    for side in ('top', 'left', 'right'):
+        cursor_ax.spines[side].set_visible(False)
+    cursor_ax.set_xlabel('Time (s)', fontsize=10, fontweight='bold', labelpad=1)
+    elapsed = cursor_ax.axvspan(start, start, color='0.75', lw=0)
+    cursor = cursor_ax.axvline(start, color='crimson', lw=2)
+
+    cax = fig.add_axes([0.905, 0.30, 0.018, 0.48])
+    sm = ScalarMappable(norm=Normalize(vmin=vlim[0], vmax=vlim[1]),
+                        cmap=tfr_params['cmap'])
+    sm.set_array([])
+    fig.colorbar(sm, cax=cax).set_label('ERD / ERS  (%)', fontsize=10)
+
+    longest = float((resolve_n_cycles(tfr_params) / np.asarray(
+        tfr_params['freqs'], dtype=float)).max())
+    header = fig.suptitle('', fontsize=12, fontweight='bold')
+
+    def draw(frame):
+        t0, t1 = drawn[frame]
+        for ax, event in zip(axes, events):
+            ax.clear()
+            tfrs[event].plot_topomap(
+                tmin=t0, tmax=t1, fmin=fmin, fmax=fmax,
+                baseline=None, mode=None,
+                vlim=vlim, cmap=tfr_params['cmap'], sensors=False,
+                axes=ax, show=False, colorbar=False,
+            )
+            ax.set_title(event, fontsize=11, fontweight='bold')
+        label_t0, label_t1 = bins[frame]
+        cursor.set_xdata([label_t1, label_t1])
+        elapsed.set_width(label_t1 - start)
+        header.set_text(
+            f'{title}\n{band_name} band ({fmin}-{fmax} Hz)   '
+            f't = {label_t0:.2f} - {label_t1:.2f} s   '
+            f'(frame {frame + 1}/{len(bins)}; {longest:.2f} s analysis window)')
+        return axes
+
+    # blit=False because every frame clears and rebuilds its axes - there is no stable set
+    # of artists for blitting to swap, and MNE redraws the head outline each call anyway.
+    anim = FuncAnimation(fig, draw, frames=len(bins), interval=1000 / tfr_params['time_anim_fps'],
+                         blit=False, repeat=True)
+    return fig, anim
+
+
+def save_time_animation(tfrs, band_name, out_dir, filename, title, vlim,
+                        paths=None, tfr_params=None):
+    """
+    Write one animation as a self-contained ``.html`` with play / pause / scrub controls.
+
+    ``to_jshtml`` embeds every frame as a base64 PNG, which is what makes the file portable
+    - it needs no ffmpeg, no server and no sibling files - and also what makes it large.
+    ``animation.embed_limit`` defaults to 20 MB and ``to_jshtml`` gives up with only a
+    warning above it, producing an html that silently holds no frames, so the limit is
+    raised for the duration of the call rather than left to chance. ``time_anim_dpi`` is the
+    dial to turn if these get too big.
+    """
+    tfr_params = tfr_params or default_tfr_params()
+    paths = paths or project_paths()
+    fig, anim = build_time_animation(tfrs, band_name, title, vlim, tfr_params)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / filename
+    with plt.rc_context({'animation.embed_limit': 256}):
+        path.write_text(anim.to_jshtml(fps=tfr_params['time_anim_fps'],
+                                       default_mode='loop'), encoding='utf-8')
+    plt.close(fig)
+    print(f"  saved {path.relative_to(paths.root)}  "
+          f"({path.stat().st_size / 1e6:.1f} MB, {len(time_bin_edges(tfr_params, tfr_params['time_anim_step']))} frames)")
+    return path
+
+
+def save_group_time_animations(group, grand, out_dir, paths=None, tfr_params=None):
+    """
+    The playable counterpart of ``save_group_time_grids``: both means, every band.
+
+    Group only. A per-subject set would be 15 subjects x 2 bands of embedded-PNG html, which
+    is hundreds of megabytes for something no one watches; the per-subject question is
+    answered by the static grids, which stay comparable because they share this scale.
+    """
+    tfr_params = tfr_params or default_tfr_params()
+    pct_by_subject, pct_grand = percent_group(group, tfr_params)
+    geo_grand = geometric_percent_grand(group, tfr_params)
+    n_subj = len(group.subjects)
+    written = []
+
+    for band_name in tfr_params['bands']:
+        vlim = time_scale_for_band(
+            band_name, [pct_grand, geo_grand], tfr_params,
+            by_subject=pct_by_subject if tfr_params['time_grid_per_subject'] else None)
+
+        for tfrs, filename, mean_name in (
+                (pct_grand, f'{band_name}_time_animation.html',
+                 "arithmetic mean of the subjects' ERD%"),
+                (geo_grand, f'{band_name}_time_animation_geomean.html',
+                 "geometric mean of the subjects' power ratios")):
+            written.append(save_time_animation(
+                tfrs, band_name, out_dir, filename,
+                f'Grand average ERD / ERS (N={n_subj}) - {mean_name}',
+                vlim, paths=paths, tfr_params=tfr_params))
+
+    return written
+
+
+#%%
+# ============================================================
 # Driver
 # ============================================================
 
@@ -557,6 +1083,7 @@ def run_tfr_group(subjects=None, events=None, bands=None, save_figs=True,
     subject_dir = group_figure_dir('Subjects', paths)
     average_dir = group_figure_dir('GrandAverage', paths)
     contrast_dir = group_figure_dir('Contrasts', paths)
+    timebin_dir = group_figure_dir('TimeBins', paths)
 
     steps = [(f'{band} subject grid',
               lambda band=band: save_subject_band_grid(group, grand, band, subject_dir,
@@ -569,7 +1096,14 @@ def run_tfr_group(subjects=None, events=None, bands=None, save_figs=True,
          lambda: save_grand_average_figures(group, grand, average_dir, paths, tfr_params)),
         ('contrasts',
          lambda: save_group_contrast_figures(group, grand, contrast_dir, paths, tfr_params)),
+        ('time-binned grids',
+         lambda: save_group_time_grids(group, grand, timebin_dir, paths, tfr_params)),
     ]
+    if tfr_params['time_anim_enabled']:
+        steps.append(
+            ('time animations',
+             lambda: save_group_time_animations(group, grand, timebin_dir, paths,
+                                                tfr_params)))
 
     failures = {}
     try:
@@ -593,7 +1127,7 @@ def run_tfr_group(subjects=None, events=None, bands=None, save_figs=True,
           f"\n{'=' * 70}")
     print(f"{'directory':<26}{'figures':>9}")
     for kind, out_dir in (('Subjects', subject_dir), ('GrandAverage', average_dir),
-                          ('Contrasts', contrast_dir)):
+                          ('Contrasts', contrast_dir), ('TimeBins', timebin_dir)):
         print(f"{f'Figures/Group/{kind}':<26}{len(list(out_dir.glob('*.png'))):>9}")
     for subject, reason in group.skipped.items():
         print(f"skipped {subject}: {reason}")
