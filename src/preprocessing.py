@@ -811,6 +811,344 @@ def select_electrodes(inst, params_dict, elecs_to_drop, ref_channel=REF_CHANNEL_
         selected_elecs = [elec for elec in selected_elecs if elec != ref_channel]
     return selected_elecs
 #%%
+# ---------------------------------------------------------------------------
+# Artifact Subspace Reconstruction, the optional step before ICA.
+# ---------------------------------------------------------------------------
+# asrpy 0.0.8 documents a 'riemann' variant but does not implement it: ASR.__init__
+# overwrites self.method with "euclid" whatever you pass, and no code downstream of
+# that reads the attribute, so the two settings produce bit-identical output with no
+# warning. Accepting 'riemann' here would therefore be exactly the silent no-op this
+# repo turns into an error everywhere else - so only the variant that actually runs
+# is allowed, and asking for the other one raises.
+#
+# What it would mean: ASR thresholds come from an average of block covariances and a
+# decomposition of each window's covariance. Euclidean ASR treats those as flat
+# vectors (geometric_median of the flattened matrices, then linalg.eigh). Riemannian
+# ASR (Blum et al. 2019) treats them as SPD matrices on a curved manifold, replacing
+# the mean with pyriemann's mean_covariance(metric='riemann') and the eigenvectors
+# with principal geodesic analysis; asrpy leaves both as comments at the exact call
+# sites. It is reported to be more robust when the CALIBRATION data is itself
+# contaminated - the regime these recordings are in, where clean_windows keeps only
+# ~a third of the samples - so it is worth wanting. meegkit.asr implements it if that
+# becomes the reason to switch backends.
+ASR_BACKENDS = ('asrpy', 'meegkit')
+ASR_METHODS = ('euclid', 'riemann')
+
+# Which backend can actually run which method. asrpy documents a 'riemann' mode but
+# does not implement it - its ASR.__init__ overwrites self.method with "euclid"
+# whatever you pass, nothing downstream reads the attribute, and the two settings
+# produce bit-identical output with no warning. So riemann is routed to meegkit,
+# and asking asrpy for it raises instead of silently doing euclid.
+ASR_METHOD_BACKENDS = {'euclid': ('asrpy', 'meegkit'), 'riemann': ('meegkit',)}
+
+# Covariance estimator for the meegkit backend, passed through to its block
+# covariance step. 'lwf' (Ledoit-Wolf shrinkage) is the default rather than
+# meegkit's own 'scm' because RIEMANN CANNOT RUN ON 'scm' HERE: the average
+# reference costs one rank, so the block covariances are singular - measured on
+# BA, 30 of 50 blocks have a non-positive eigenvalue (min -1.06e-23, condition
+# number 6e16) - and the riemannian mean needs a matrix logarithm, which is only
+# defined for strictly positive definite input. meegkit stops with "Matrices must
+# be positive definite. Add regularization to avoid this error." Shrinkage
+# regularises them back to SPD. Euclidean ASR is unaffected either way.
+ASR_ESTIMATORS = ('scm', 'lwf', 'oas', 'mcd')
+
+# Budget for the largest intermediate array inside asrpy's asr_process, which holds
+# a moving covariance of shape (samples per split, n_channels ** 2) in float64. Its
+# own mem_splits default of 3 sizes that from nothing at all: on a 64-channel,
+# half-hour recording it asks for ~10 GB and the call dies with MemoryError before
+# it has cleaned anything. Splitting is not an approximation - asr_process carries
+# its filter state, covariance and mixing matrix across the split boundaries - so
+# this trades only a little speed. 512 MB leaves room for the two or three copies
+# of that array numpy makes en route. meegkit chunks internally and needs none of it.
+ASR_SPLIT_BYTES = 512 * 1024 ** 2
+
+# A channel this many times louder than the median one is called out before ASR
+# runs. Not a rejection threshold - nothing is dropped - just the point past which
+# a channel is loud enough to drive ASR's calibration for the whole montage.
+ASR_LOUD_CHANNEL_RATIO = 5
+
+
+def _import_asr(backend):
+    """Import an ASR backend on demand, with an actionable message when it is missing.
+
+    Imported here rather than at module scope so that this module - and hence the
+    whole package - still imports in an environment without either backend, which
+    is every environment while 'PerformAsr' is off (the default).
+
+    A note on versions, because it is not a free choice: the meegkit backend must be
+    **0.1.7**. From 0.1.9 meegkit requires pyriemann >= 0.7, and 0.2.0 requires
+    >= 0.12 - and pyriemann 0.12 calls ndarray.mT, which exists only in numpy >= 2.0.
+    This environment is pinned to numpy 1.26 for mne 1.6.1, so installing that chain
+    breaks the classifier stack outright (Covariances(estimator='oas') dies with
+    "'numpy.ndarray' object has no attribute 'mT'"). 0.1.7 is the last release that
+    talks to pyriemann 0.3, which is what the TS+FGDA pipeline is built on:
+
+        python -m pip install "meegkit==0.1.7" pymanopt
+    """
+    if backend == 'asrpy':
+        try:
+            import asrpy
+        except ImportError as err:
+            raise ImportError(
+                "PerformAsr is on but asrpy is not installed. Install it into the "
+                "kernel's environment:\n"
+                "    python -m pip install asrpy") from err
+        return asrpy
+    if backend == 'meegkit':
+        try:
+            from meegkit.asr import ASR as MeegkitASR
+        except ImportError as err:
+            raise ImportError(
+                "asr_backend='meegkit' needs meegkit and pymanopt. Pin the version - "
+                "newer ones force a pyriemann upgrade this environment cannot take "
+                "(see _import_asr):\n"
+                '    python -m pip install "meegkit==0.1.7" pymanopt') from err
+        return MeegkitASR
+    raise ValueError(f"asr_backend must be one of {ASR_BACKENDS}, got {backend!r}.")
+
+
+def _asr_with_asrpy(raw, params_dict, eeg_picks, n_times):
+    """Run asrpy's euclidean ASR. Returns (cleaned raw, calibration sample mask)."""
+    asrpy = _import_asr('asrpy')
+    n_channels = len(eeg_picks)
+    samples_per_split = max(1, int(ASR_SPLIT_BYTES / (n_channels ** 2 * 8)))
+    mem_splits = max(1, int(np.ceil(n_times / samples_per_split)))
+
+    asr = asrpy.ASR(sfreq=raw.info['sfreq'],
+                    cutoff=params_dict.get('asr_cutoff', 20),
+                    max_bad_chans=params_dict.get('asr_max_bad_chans', 0.1),
+                    method='euclid')
+    # return_clean_window hands back which samples the calibration considered clean.
+    # It costs nothing extra - fit computes the mask either way - and it is what makes
+    # the report below meaningful.
+    _, sample_mask = asr.fit(raw, return_clean_window=True)
+    # returns a copy (apply_function on raw.copy()), so the input is left alone
+    return asr.transform(raw, mem_splits=mem_splits), sample_mask
+
+
+def _asr_with_meegkit(raw, params_dict, eeg_picks, before):
+    """Run meegkit's ASR, which is the one that implements the riemannian variant.
+
+    meegkit works on plain arrays, so the cleaned data is written back through
+    ``apply_function`` on a copy - the same route asrpy takes internally, which
+    keeps info and annotations intact.
+    """
+    MeegkitASR = _import_asr('meegkit')
+    method = params_dict.get('asr_method', 'euclid')
+    asr = MeegkitASR(sfreq=raw.info['sfreq'],
+                     cutoff=params_dict.get('asr_cutoff', 20),
+                     method=method,
+                     estimator=params_dict.get('asr_estimator', 'lwf'))
+    # max_bad_chans is hard-coded to 0.3 in meegkit 0.1.7's __init__ and read off the
+    # instance by fit(), so honouring the parameter means setting it here. Without
+    # this the key would quietly mean nothing on this backend.
+    asr.max_bad_chans = params_dict.get('asr_max_bad_chans', 0.1)
+    # meegkit downgrades riemann -> euclid with a logging.warning (not a Python
+    # warning, so it is easy to miss) when pyriemann is absent. Catch that here
+    # rather than let a run be labelled riemann when it was not.
+    if asr.method != method:
+        raise RuntimeError(
+            f"meegkit silently changed the ASR method from {method!r} to "
+            f"{asr.method!r} - pyriemann is probably not importable.")
+
+    clean, sample_mask = asr.fit(before)
+    cleaned_data = asr.transform(before)
+    cleaned = raw.copy()
+    cleaned.apply_function(lambda _: cleaned_data, picks=eeg_picks,
+                           channel_wise=False)
+    return cleaned, sample_mask
+
+
+def apply_asr(raw, params_dict):
+    """Optionally clean transient artifacts out of continuous data with ASR.
+
+    Does nothing unless params_dict['PerformAsr'] is True. While it is off - the
+    default - this is a pure no-op returning the caller's own object, so every
+    result predating this function is reproduced exactly.
+
+    ASR calibrates on the quiet stretches of THIS recording (the backend's own
+    clean-window search finds them), builds a covariance of what clean data looks
+    like, then slides over the data reconstructing any subspace whose variance
+    exceeds 'asr_cutoff' standard deviations of that reference from the remaining
+    channels. Unlike ICA it is local in time: it edits the seconds that are
+    contaminated and leaves the rest alone. Measured on BA_MI1 at the default
+    cutoff of 20: 0.1% of the variance removed from the stretches its calibration
+    called clean, which correlate at 0.999 with the input, against 57% from the
+    rest. That contrast is the thing to check when tuning the cutoff, and it is
+    what the report printed at the end of this function shows.
+
+    BACKENDS AND METHODS
+    --------------------
+    'euclid' is classic ASR (Mullen et al.), available on both backends.
+
+    'riemann' is the Blum et al. 2019 modification and needs asr_backend='meegkit'.
+    Covariance matrices are SPD matrices on a curved manifold, and averaging them as
+    if the space were flat is biased; the riemannian variant replaces the euclidean
+    mean with the geometric one - in BOTH the calibration and the per-window
+    processing step - which is reported to be more robust when the calibration data
+    is itself contaminated. That is this cohort's regime: clean_windows keeps only
+    about a third of these recordings.
+
+    BUT MEASURE BEFORE YOU TRUST IT. meegkit marks its riemannian eigenstep
+    (nonlinear_eigenspace, a pymanopt trust-region solve on a Grassmann manifold)
+    with a TODO upstream, and it shows. On BA_MI1, 5 minutes, cutoff 20 vs 40 vs 100
+    produce identical output: 100% of samples rewritten, 25% of variance removed
+    overall and 34% removed from the samples its own calibration called clean. A
+    cutoff of 100 SD should be nearly a no-op. The threshold is reaching the backend
+    (meegkit's euclid does differ between cutoff 5 and 20), so this is the riemannian
+    path itself, not the plumbing. For contrast, asrpy euclid at cutoff 100 alters
+    8.3% of samples and removes 0.0% on the clean stretches - which is what a
+    correctly thresholded ASR looks like. Riemann is available here so it can be
+    tried and measured; it is not a drop-in improvement.
+
+    'riemann' also requires a regularising asr_estimator ('lwf' by default) - see
+    ASR_ESTIMATORS for why 'scm' cannot work on average-referenced data.
+
+    WHERE THIS SITS IN THE CHAIN, and why it is here and nowhere else:
+
+    * AFTER the 1-100 Hz high-pass and the 50 Hz notch. ASR's calibration is a
+      variance estimate, so on unfiltered data the drift dominates it and the
+      thresholds describe the drift rather than the artifacts.
+    * BEFORE the analysis band-pass, so the statistics are computed on broadband
+      data whatever band the caller ends up analysing. This is what lets the same
+      'asr_cutoff' mean the same thing in the TFR stack (1-None Hz) and the
+      classifier stack (8-32 Hz).
+    * BEFORE compute_current_source_density, which mixes channels and changes the
+      units the thresholds are in.
+    * BEFORE ICA, which is the point of the exercise: removing the large
+      transients first stops them from dominating the decomposition, so the
+      components left to review are the stationary artifacts ICA is good at.
+
+    Calibration is per call, i.e. per recording, because that is how the callers
+    are structured - EEG_Preprocessing runs once per xdf file. That is the
+    desirable grain anyway: impedance and electrode contact differ between
+    sessions, and a threshold from one session describes the next one poorly.
+
+    COST: asrpy runs at about 0.22 s per second of 64-channel 500 Hz data, measured
+    linearly over 2 and 5 minute segments - ~11 min for one subject's three
+    recordings, roughly 3 hours to rebuild the whole cohort's epoch cache. meegkit
+    is faster for euclid and somewhat slower for riemann.
+
+    Parameters
+    ----------
+    raw : instance of Raw
+        Preloaded, high-pass filtered, EEG channels only. NOT modified.
+    params_dict : dict
+        Reads 'PerformAsr' (default False), 'asr_backend', 'asr_cutoff',
+        'asr_max_bad_chans', 'asr_method', 'asr_estimator'.
+
+    Returns
+    -------
+    raw : instance of Raw
+        The caller's own object when ASR is off; a cleaned copy when it is on.
+    """
+    if not params_dict.get('PerformAsr', False):
+        return raw
+
+    backend = params_dict.get('asr_backend', 'asrpy')
+    method = params_dict.get('asr_method', 'euclid')
+    estimator = params_dict.get('asr_estimator', 'lwf')
+    cutoff = params_dict.get('asr_cutoff', 20)
+    max_bad_chans = params_dict.get('asr_max_bad_chans', 0.1)
+
+    if backend not in ASR_BACKENDS:
+        raise ValueError(f"asr_backend must be one of {ASR_BACKENDS}, got {backend!r}.")
+    if method not in ASR_METHODS:
+        raise ValueError(f"asr_method must be one of {ASR_METHODS}, got {method!r}.")
+    if backend not in ASR_METHOD_BACKENDS[method]:
+        raise ValueError(
+            f"asr_method={method!r} is not available on asr_backend={backend!r}; "
+            f"it needs one of {ASR_METHOD_BACKENDS[method]}. asrpy documents a "
+            f"riemannian mode but hard-codes itself back to euclidean, so allowing "
+            f"this would silently give you euclidean ASR labelled as riemannian.")
+    if estimator not in ASR_ESTIMATORS:
+        raise ValueError(f"asr_estimator must be one of {ASR_ESTIMATORS}, got "
+                         f"{estimator!r}.")
+
+    detail = f", estimator {estimator!r}" if backend == 'meegkit' else ''
+    print('\n###########################################################')
+    print(f'running ASR before ICA ({backend}, method {method!r}{detail}, '
+          f'cutoff {cutoff} SD, max_bad_chans {max_bad_chans})')
+    if method == 'riemann':
+        print("  !! riemannian ASR here does NOT respond to asr_cutoff. Measured on "
+              "BA_MI1, 5 min:")
+        print("     cutoff 20 / 40 / 100 all give the same output - 100% of samples "
+              "rewritten and 34%")
+        print("     of the variance removed from the stretches its own calibration "
+              "called clean (asrpy")
+        print("     euclid removes 0.0-0.1% there). meegkit marks its riemannian "
+              "eigenstep TODO upstream,")
+        print("     which fits. Treat this as an experiment, not a tuned method.")
+    #picked by index, so `before`, `after` and `cleaned_names` are the same
+    #channels in the same order - raw.ch_names is not necessarily eeg-only
+    eeg_picks = mne.pick_types(raw.info, eeg=True)
+    cleaned_names = [raw.ch_names[i] for i in eeg_picks]
+    before = raw.get_data(picks=eeg_picks)
+
+    # A single loud electrode is the one thing that derails this step, and these
+    # pipelines drop no bad channels by design (the TFR/benchmark params set
+    # bad_electrodes empty to keep every subject's montage stackable). After
+    # average referencing, that electrode is present in EVERY channel, so ASR
+    # chases it across the whole montage and clean_windows rejects most of the
+    # recording as uncalibratable. Say so rather than letting it show up as an
+    # unexplained "ASR removed most of the variance".
+    channel_std = before.std(axis=1)
+    loud = [(name, std / np.median(channel_std))
+            for name, std in zip(cleaned_names, channel_std)
+            if std > ASR_LOUD_CHANNEL_RATIO * np.median(channel_std)]
+    if loud:
+        print('  !! ' + ', '.join(f'{name} is {ratio:.0f}x the median channel'
+                                  for name, ratio in loud))
+        print('     ASR calibrates on the montage as given and nothing here drops bad '
+              'electrodes, so')
+        print('     after the average reference this sits in every channel and ASR will '
+              'chase it in all')
+        print('     of them. Consider listing it in bad_electrodes, or expect heavy '
+              'cleaning.')
+
+    if backend == 'asrpy':
+        cleaned, sample_mask = _asr_with_asrpy(raw, params_dict, eeg_picks, raw.n_times)
+    else:
+        cleaned, sample_mask = _asr_with_meegkit(raw, params_dict, eeg_picks, before)
+
+    #both backends rebuild the Raw through apply_function, so info and annotations
+    #come through untouched - but the epoching downstream reads the annotations, and
+    #a silent loss of them would show up as "0 epochs" several steps later rather
+    #than here. Cheap to assert, so assert it.
+    if len(cleaned.annotations) != len(raw.annotations):
+        raise RuntimeError(
+            f"ASR changed the annotation count "
+            f"({len(raw.annotations)} -> {len(cleaned.annotations)}); the events "
+            f"downstream are derived from these.")
+
+    # What ASR actually did. Reported as three numbers rather than one, because on a
+    # recording with a genuinely bad channel the single "variance removed" figure
+    # reads like ASR ate the signal when it did nothing of the sort:
+    #
+    #   overall     dominated by the artifacts, so it tracks how dirty the recording
+    #               is more than how aggressive ASR was
+    #   on clean    the number that says whether ASR stayed off the data it was
+    #               supposed to leave alone. Near zero is correct and expected;
+    #               anything substantial means the cutoff is eating real signal
+    #   altered     what fraction of the recording ASR actually rewrote
+    after = cleaned.get_data(picks=eeg_picks)
+    mask = np.asarray(sample_mask).ravel().astype(bool)
+    variance_removed = 1 - after.var(axis=1) / np.where(
+        before.var(axis=1) == 0, np.nan, before.var(axis=1))
+    scale = np.median(channel_std)
+    altered = (np.abs(before - after).max(axis=0) > 0.1 * scale).mean()
+    report = (f'ASR altered {100 * altered:.1f}% of samples; variance removed '
+              f'{100 * np.nanmean(variance_removed):.1f}% overall')
+    if mask.any() and mask.size == before.shape[1]:
+        on_clean = 1 - after[:, mask].var(axis=1) / np.where(
+            before[:, mask].var(axis=1) == 0, np.nan, before[:, mask].var(axis=1))
+        report += (f', {100 * np.nanmean(on_clean):.1f}% on the '
+                   f'{100 * mask.mean():.0f}% of samples its calibration called clean')
+    print(report)
+    return cleaned
+
+
+#%%
 def raw_EEG_Preprocessing (current_path,raw, params_dict):
 
     #extract the current run paramaters: 
@@ -837,18 +1175,24 @@ def raw_EEG_Preprocessing (current_path,raw, params_dict):
     if (filter_method == 'iir'):
         notched_Raw = unfiltered_Raw.filter(1,100, method=filter_method, phase='forward', pad=0)
         notched_Raw.notch_filter(50, method=filter_method, phase='forward') 
+        notched_Raw = apply_asr(notched_Raw, params_dict)
         if PerformCsd:
             notched_Raw = mne.preprocessing.compute_current_source_density(notched_Raw) # Perform current source density
         Raw_Filtered = notched_Raw.filter(LowPass, 100, method=filter_method, iir_params = dict(order=4, ftype='butter'),phase='forward',pad=0)
     if (filter_method == 'fir'):
         notched_Raw = unfiltered_Raw.filter(1,None, method=filter_method)  
         notched_Raw.notch_filter(50, method=filter_method) 
+        notched_Raw = apply_asr(notched_Raw, params_dict)
         if PerformCsd:
             notched_Raw = mne.preprocessing.compute_current_source_density(notched_Raw) # Perform current source density
         Raw_Filtered = notched_Raw
     return Raw_Filtered
 
 def Post_ICA_EEG_Preprocessing (current_path,raw, params_dict):
+    #NO apply_asr call in here, deliberately. ASR belongs before ICA, and this
+    #function is the second half of a raw_EEG_Preprocessing -> ICA -> here
+    #sequence whose first half already ran it - calling it again would clean
+    #already-cleaned data against a fresh set of thresholds.
     #extract the current run paramaters: 
     PerformCsd=params_dict['PerformCsd']
     LowPass, HighPass, filter_method = params_dict['LowPass'],params_dict['HighPass'],params_dict['filter_method']
@@ -1052,12 +1396,14 @@ def EEG_Preprocessing (current_path,raw, params_dict, pick_channels=True):
     if (filter_method == 'iir'):
         notched_Raw = unfiltered_Raw.filter(1, 100, method=filter_method, phase='forward', pad=0)
         notched_Raw.notch_filter(50, method=filter_method, phase='forward') 
+        notched_Raw = apply_asr(notched_Raw, params_dict)
         if PerformCsd:
             notched_Raw = mne.preprocessing.compute_current_source_density(notched_Raw) # Perform current source density
         Raw_Filtered = notched_Raw.filter(LowPass, HighPass, method=filter_method, iir_params = dict(order=4, ftype='butter'),phase='forward',pad=0)
     if (filter_method == 'fir'):
         notched_Raw = unfiltered_Raw.filter(1, 100, method=filter_method)  
         notched_Raw.notch_filter(50, method=filter_method) 
+        notched_Raw = apply_asr(notched_Raw, params_dict)
         if PerformCsd:
             notched_Raw = mne.preprocessing.compute_current_source_density(notched_Raw) # Perform current source density
         Raw_Filtered = notched_Raw.filter(LowPass, HighPass, method=filter_method)

@@ -45,7 +45,9 @@ from sklearn.model_selection import RepeatedStratifiedKFold
 
 from . import params_spec
 from .group_analysis import _get_classes_initials
-from .preprocessing import EVENT_LABEL_ALIASES, get_subject_bad_electrodes
+from .preprocessing import (ASR_BACKENDS, ASR_ESTIMATORS, ASR_METHOD_BACKENDS,
+                            ASR_METHODS, EVENT_LABEL_ALIASES,
+                            get_subject_bad_electrodes)
 from .tfr_batch import ELECTRODE_GROUPS as _TFR_ELECTRODE_GROUPS
 # list_subjects / subject_files are re-exported for the analysis modules and
 # their notebooks, which import them from here rather than from tfr_batch.
@@ -85,7 +87,19 @@ FIGURE_DPI = 150
 # Params that invalidate a cached epochs file when they change.
 _META_PARAM_KEYS = ('PerformCsd', 'PerformAvgRef', 'AddRefChannel', 'CenterByClass',
                     'filter_method', 'epoch_tmin', 'epoch_tmax', 'LowPass', 'HighPass',
-                    'Electorde_Group', 'bad_electrodes', 'desired_events')
+                    'Electorde_Group', 'bad_electrodes', 'desired_events',
+                    'PerformAsr', 'asr_backend', 'asr_cutoff', 'asr_max_bad_chans',
+                    'asr_method', 'asr_estimator')
+
+# What a meta that predates a key was necessarily built with. Only keys ADDED to
+# _META_PARAM_KEYS after caches already existed need an entry: without one,
+# _check_meta reads the cache's silence as None, compares it against the current
+# default, and declares every .fif in the tree stale - a multi-GB rebuild to reach
+# byte-identical epochs. Every ASR key defaults to 'ASR off', which is precisely
+# what the runs that wrote those caches did.
+_META_PARAM_DEFAULTS = {'PerformAsr': False, 'asr_backend': 'asrpy',
+                        'asr_cutoff': 20, 'asr_max_bad_chans': 0.1,
+                        'asr_method': 'euclid', 'asr_estimator': 'lwf'}
 
 # Every params key the pipeline reads, grouped by how a NOTEBOOK should treat it.
 # The notebooks spell the whole dict out in a parameters cell, so the distinction
@@ -95,11 +109,16 @@ _META_PARAM_KEYS = ('PerformCsd', 'PerformAvgRef', 'AddRefChannel', 'CenterByCla
 PARAM_GROUPS = {
     # Edit freely - these reach the pipeline exactly as written.
     'active': ('desired_events', 'Electorde_Group', 'PerformAvgRef', 'AddRefChannel',
-               'CenterByClass', 'PerformCsd', 'filter_method', 'LowPass', 'HighPass',
+               'CenterByClass', 'PerformCsd', 'PerformAsr', 'asr_backend',
+               'asr_cutoff', 'asr_max_bad_chans', 'asr_method', 'asr_estimator',
+               'filter_method', 'LowPass', 'HighPass',
                'epoch_tmin', 'epoch_tmax', 'classifier_window_s', 'classifier_window_e',
                'windowed_prediction_params', 'augmentation_params', 'pipeline_name'),
-    # Read only by the CSP / FBCSP pipelines - inert while pipeline_name is 'ts+FGDA'.
-    'pipeline': ('n_components', 'n_components_fbcsp', 'filters_bands'),
+    # Read only by the CSP / FBCSP / FBRK pipelines - inert while pipeline_name is
+    # 'ts+FGDA'. Absent from default_params(), the last three: a cell that does not
+    # set them takes the library defaults in training.py, and describe() stays quiet.
+    'pipeline': ('n_components', 'n_components_fbcsp', 'filters_bands',
+                 'fbrk_bands', 'svm_C', 'svm_kernel', 'svm_probability'),
     # Written by the pipeline itself; an edit in a notebook is silently discarded.
     'auto': ('bad_electrodes', 'events_trigger_dict',
              'epoch_tmins_and_maxes_grid', 'sfreq'),
@@ -112,6 +131,12 @@ PARAM_DOCS = {
     'AddRefChannel': 'reconstruct FCz (the online reference); requires PerformAvgRef',
     'CenterByClass': 'per-class mean removal; each epoch variant overrides it per build',
     'PerformCsd': 'current-source-density transform',
+    'PerformAsr': 'run ASR on the continuous data before ICA / epoching',
+    'asr_cutoff': 'ASR rejection threshold, SD of the clean calibration data',
+    'asr_max_bad_chans': 'max bad-channel fraction a calibration window may have',
+    'asr_backend': "'asrpy' or 'meegkit'; riemann needs meegkit",
+    'asr_method': "'euclid' or 'riemann' (Blum et al.; meegkit backend only)",
+    'asr_estimator': "meegkit covariance estimator; riemann needs 'lwf' here",
     'filter_method': "MNE filter method ('iir' / 'fir')",
     'LowPass': 'band-pass low edge, Hz',
     'HighPass': 'band-pass high edge, Hz',
@@ -125,17 +150,23 @@ PARAM_DOCS = {
     'n_components': 'CSP components (CSP pipelines only)',
     'n_components_fbcsp': 'FBCSP components (fbcsp+lda only)',
     'filters_bands': 'FBCSP filter bank, Hz (fbcsp+lda only)',
+    'fbrk_bands': 'FBRK filter bank, Hz (fbrk+svm only); keep inside LowPass..HighPass',
+    'svm_C': 'SVM regularisation (fbrk+svm only)',
+    'svm_kernel': 'SVM kernel (fbrk+svm only)',
+    'svm_probability': 'fit SVM probabilities; only for a model a live loop calls predict_proba on',
     'bad_electrodes': 'per subject, from get_subject_bad_electrodes - set by subject_params',
     'events_trigger_dict': "per subject, from epochs.event_id - set by the batch",
     'epoch_tmins_and_maxes_grid': 'vestigial: read nowhere in this repo',
-    'sfreq': 'sampling rate fallback, read by one training branch only',
+    'sfreq': "sampling rate; the CV runners set it from epochs.info before"
+             " fitting, and fbrk+svm / shallowfbcspnet read it",
 }
 
 KNOWN_PARAM_KEYS = frozenset(key for group in PARAM_GROUPS.values() for key in group)
 
 _PARAM_GROUP_TITLES = {
     'active': 'ACTIVE',
-    'pipeline': "NOT USED BY PIPELINE {pipeline!r}",
+    'pipeline': "PIPELINE KNOBS - each is read by one pipeline family only, "
+                "so {pipeline!r} ignores the rest",
     'auto': 'SET AUTOMATICALLY - edits here are discarded',
 }
 
@@ -236,6 +267,13 @@ def default_params(electrode_group_names=ELECTRODE_GROUP_NAMES, desired_events=N
     """
     params_dict = {}
     params_dict['PerformCsd'] = False
+    params_dict['PerformAsr'] = False       # ASR before ICA; see
+                                            # preprocessing.apply_asr
+    params_dict['asr_backend'] = 'asrpy'    # 'meegkit' for riemannian ASR
+    params_dict['asr_cutoff'] = 20
+    params_dict['asr_max_bad_chans'] = 0.1
+    params_dict['asr_method'] = 'euclid'
+    params_dict['asr_estimator'] = 'lwf'    # meegkit only; riemann needs it
     params_dict['PerformAvgRef'] = True
     params_dict['AddRefChannel'] = True     # reconstruct FCz, the online reference
     params_dict['CenterByClass'] = True     # per-class mean removal; the epoch
@@ -360,6 +398,45 @@ def check_params(params_dict, label=None, paths=None):
     if params_dict.get('AddRefChannel') and not params_dict.get('PerformAvgRef'):
         raise ValueError("AddRefChannel=True requires PerformAvgRef=True: without "
                          "average referencing the reconstructed FCz is all zeros.")
+    if params_dict.get('PerformAsr'):
+        if params_dict.get('asr_cutoff', 20) <= 0:
+            raise ValueError(f"asr_cutoff must be > 0, got "
+                             f"{params_dict['asr_cutoff']}.")
+        method = params_dict.get('asr_method', 'euclid')
+        backend = params_dict.get('asr_backend', 'asrpy')
+        estimator = params_dict.get('asr_estimator', 'lwf')
+        if method not in ASR_METHODS:
+            raise ValueError(f"asr_method must be one of {ASR_METHODS}, got "
+                             f"{method!r}.")
+        if backend not in ASR_BACKENDS:
+            raise ValueError(f"asr_backend must be one of {ASR_BACKENDS}, got "
+                             f"{backend!r}.")
+        if estimator not in ASR_ESTIMATORS:
+            raise ValueError(f"asr_estimator must be one of {ASR_ESTIMATORS}, got "
+                             f"{estimator!r}.")
+        # Caught here rather than three hours into a batch: asrpy accepts 'riemann'
+        # and silently runs euclidean, so this pairing is the difference between a
+        # riemannian run and a mislabelled euclidean one.
+        if backend not in ASR_METHOD_BACKENDS[method]:
+            raise ValueError(
+                f"asr_method={method!r} needs asr_backend in "
+                f"{ASR_METHOD_BACKENDS[method]}, not {backend!r}.")
+        if method == 'riemann' and estimator == 'scm':
+            raise ValueError(
+                "asr_method='riemann' cannot use asr_estimator='scm': the average "
+                "reference leaves the block covariances singular, and the riemannian "
+                "mean needs a matrix logarithm, which is only defined for strictly "
+                "positive definite input. Use 'lwf' (the default).")
+        # Same class of invariant as AddRefChannel above: the live loop rebuilds the
+        # offline chain step for step, and it has no ASR step. A model trained on
+        # ASR-cleaned epochs is therefore seeing something at inference time that it
+        # never saw in training.
+        print("  !! PerformAsr is on. The live loop (notebooks/Live_Stream.ipynb) does "
+              "not run ASR, so a model")
+        print("     trained here will not match the data it sees online unless the "
+              "fitted ASR is applied there")
+        print("     too. Fine for offline analysis; check before deploying a model.")
+
     if params_dict['HighPass'] <= params_dict['LowPass']:
         raise ValueError(f"HighPass ({params_dict['HighPass']}) must exceed LowPass "
                          f"({params_dict['LowPass']}).")
@@ -539,7 +616,8 @@ def _check_meta(subject, meta, files, params_dict):
     if meta.get('files') != current_files:
         reasons.append('recordings changed')
     cached, current = meta.get('params', {}), _serializable_params(params_dict)
-    changed = [k for k in _META_PARAM_KEYS if cached.get(k) != current.get(k)]
+    changed = [k for k in _META_PARAM_KEYS
+               if cached.get(k, _META_PARAM_DEFAULTS.get(k)) != current.get(k)]
     if changed:
         reasons.append(f"params changed: {changed}")
     if reasons:

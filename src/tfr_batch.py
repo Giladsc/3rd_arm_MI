@@ -134,6 +134,39 @@ def default_tfr_params():
         'cmap': 'RdBu_r',
         'figure_dpi': 150,
 
+        # --- time-binned topomap grid (stage 4b) ---
+        # The binned grid trades the single active_window topomap for a time COURSE:
+        # rows = conditions, columns = consecutive short bins. Two things about it are
+        # not obvious.
+        #
+        # It is drawn on a true PERCENT scale - (10**logratio - 1) * 100 - because a
+        # colorbar reading '%' has to mean percent. That is a different scale from every
+        # other figure here, so 'vlim' deliberately does not reach it; it autoscales
+        # through 'autoscale_pct' like the other two group figures.
+        #
+        # And the bins are NOT independent. The analysis window is T = n_cycles / freq,
+        # which resolve_n_cycles holds at 1.0 s at every frequency, so 0.2 s bins share
+        # ~80% of the data that produced them. The grid is a smoothed time course sampled
+        # every 0.2 s, not five independent samples per second. check_tfr_params prints
+        # this with the real numbers whenever the step is shorter than T.
+        'time_grid_window': (0.0, 5.0),
+        'time_grid_step': 0.2,
+        'time_grid_cols': 10,           # per block; 25 bins -> 0-2 s, 2-4 s, 4-5 s. The
+                                        # last block is half width: block edges are kept on
+                                        # whole seconds rather than made equal.
+        'time_grid_per_subject': True,
+
+        # The same data as a playable animation: one topomap per condition, stepped through
+        # the window, written as a self-contained .html with play / pause / scrub controls.
+        # 'time_anim_step' is PLAYBACK SMOOTHNESS, not resolution - it is well under the
+        # 1.0 s analysis window either way, so a finer step interpolates a smoother sweep
+        # over the same underlying estimates rather than resolving anything new.
+        'time_anim_enabled': True,
+        'time_anim_step': 0.1,          # -> 50 frames over 0-5 s
+        'time_anim_fps': 5,             # 10 s to play the whole window
+        'time_anim_dpi': 110,           # below figure_dpi: every frame is embedded in the
+                                        # html as a base64 PNG, so dpi drives the file size
+
         # --- ICA (stage 1) ---
         'ica_n_components': None,       # None -> len(ch_names) - 1, the rank after avg ref
         'ica_decim': 3,
@@ -149,6 +182,9 @@ TFR_PARAM_GROUPS = {
     'spectral': ('freqs', 'n_cycles', 'time_bandwidth', 'decim', 'lowpass', 'n_jobs'),
     'baseline': ('mode', 'baseline', 'active_window', 'bands'),
     'figures': ('vlim', 'autoscale_pct', 'cmap', 'figure_dpi'),
+    'time_grid': ('time_grid_window', 'time_grid_step', 'time_grid_cols',
+                  'time_grid_per_subject', 'time_anim_enabled', 'time_anim_step',
+                  'time_anim_fps', 'time_anim_dpi'),
     'ica': ('ica_n_components', 'ica_decim', 'ica_random_state', 'ica_method',
             'iclabel_exclude_labels'),
 }
@@ -169,6 +205,14 @@ TFR_PARAM_DOCS = {
                      '(100 = max, nothing clips)',
     'cmap': 'colormap for the group band maps',
     'figure_dpi': 'resolution every figure is saved at',
+    'time_grid_window': 'span the binned topomap grid covers, s',
+    'time_grid_step': 'width of one bin (one column) in the binned grid, s',
+    'time_grid_cols': 'columns per stacked block; the grid wraps after this many bins',
+    'time_grid_per_subject': 'also write one binned grid per subject, not just the group',
+    'time_anim_enabled': 'also write the playable .html animation of the same window',
+    'time_anim_step': 'width of one animation FRAME, s (playback smoothness, not resolution)',
+    'time_anim_fps': 'animation playback rate, frames per second',
+    'time_anim_dpi': 'resolution each embedded animation frame is rendered at',
     'ica_n_components': 'None -> len(ch_names) - 1 (one rank lost to the average ref)',
     'ica_decim': 'decimation while FITTING ICA',
     'ica_random_state': 'ICA seed; changing it reorders components',
@@ -203,6 +247,7 @@ _TFR_GROUP_TITLES = {
     'spectral': 'TFR - SPECTRAL ESTIMATION',
     'baseline': 'TFR - BASELINE AND WINDOWS',
     'figures': 'TFR - FIGURES',
+    'time_grid': 'TFR - TIME GRID AND ANIMATION (stage 4b)',
     'ica': 'TFR - ICA (stage 1; changing these needs a fresh review)',
 }
 
@@ -236,6 +281,8 @@ def resolve_n_cycles(tfr_params):
 # readback, because a cell that carefully sets classifier_window_s is setting nothing.
 _TFR_LIVE_PREPROCESSING = ('desired_events', 'Electorde_Group', 'PerformAvgRef',
                            'AddRefChannel', 'CenterByClass', 'PerformCsd',
+                           'PerformAsr', 'asr_backend', 'asr_cutoff',
+                           'asr_max_bad_chans', 'asr_method', 'asr_estimator',
                            'filter_method', 'LowPass', 'HighPass',
                            'epoch_tmin', 'epoch_tmax', 'bad_electrodes')
 
@@ -275,6 +322,12 @@ PREPROCESSING_DOCS = {
     'AddRefChannel': 'reconstruct FCz; off here, so the FC group has no FCz',
     'CenterByClass': 'per-class mean removal - this is what makes the TFRs INDUCED power',
     'PerformCsd': 'CSD inside EEG_Preprocessing; off, CSD is applied after ICA instead',
+    'PerformAsr': 'run ASR on the continuous data before ICA is fitted',
+    'asr_cutoff': 'ASR rejection threshold, SD of the clean calibration data',
+    'asr_max_bad_chans': 'max bad-channel fraction a calibration window may have',
+    'asr_backend': "'asrpy' or 'meegkit'; riemann needs meegkit",
+    'asr_method': "'euclid' or 'riemann' (Blum et al.; meegkit backend only)",
+    'asr_estimator': "meegkit covariance estimator; riemann needs 'lwf' here",
     'filter_method': "MNE filter method ('iir' / 'fir')",
     'LowPass': 'high-pass edge, Hz (1 Hz, as ICA needs)',
     'HighPass': 'low-pass edge, Hz; None = none here, the TFR lowpass does it',
@@ -321,7 +374,7 @@ def check_tfr_params(params_dict, tfr_params, label=None, paths=None):
                          f"percentile in (0, 100].")
 
     tmin, tmax = params_dict['epoch_tmin'], params_dict['epoch_tmax']
-    for name in ('baseline', 'active_window'):
+    for name in ('baseline', 'active_window', 'time_grid_window'):
         start, end = tfr_params[name]
         if start >= end:
             raise ValueError(f"{name} = {tfr_params[name]} does not run forwards.")
@@ -332,6 +385,38 @@ def check_tfr_params(params_dict, tfr_params, label=None, paths=None):
         raise ValueError(
             f"baseline = {tfr_params['baseline']} extends past the cue at t=0, which "
             f"pulls task power into the reference every TFR is divided by.")
+
+    # The binned grid's columns have to tile its window exactly. A step that leaves a
+    # remainder would silently drop or half-draw the last bin, which reads as a missing
+    # column rather than as a settings error.
+    grid_start, grid_end = tfr_params['time_grid_window']
+    step = tfr_params['time_grid_step']
+    if step <= 0:
+        raise ValueError(f"time_grid_step must be > 0, got {step}.")
+    n_bins = (grid_end - grid_start) / step
+    if abs(n_bins - round(n_bins)) > 1e-9:
+        raise ValueError(
+            f"time_grid_window = {tfr_params['time_grid_window']} is not a whole number "
+            f"of {step} s bins ({n_bins:.4f} of them); the last column would be partial.")
+    if tfr_params['time_grid_cols'] < 1:
+        raise ValueError(f"time_grid_cols must be >= 1, got "
+                         f"{tfr_params['time_grid_cols']}.")
+    # Same rule for the animation's frames: a remainder would leave a final frame narrower
+    # than the rest, which on a playing animation reads as a stutter at the end rather than
+    # as a settings error.
+    anim_step = tfr_params['time_anim_step']
+    if anim_step <= 0:
+        raise ValueError(f"time_anim_step must be > 0, got {anim_step}.")
+    n_frames = (grid_end - grid_start) / anim_step
+    if abs(n_frames - round(n_frames)) > 1e-9:
+        raise ValueError(
+            f"time_grid_window = {tfr_params['time_grid_window']} is not a whole number "
+            f"of {anim_step} s animation frames ({n_frames:.4f} of them); the last frame "
+            f"would be short.")
+    if tfr_params['time_anim_fps'] <= 0:
+        raise ValueError(f"time_anim_fps must be > 0, got {tfr_params['time_anim_fps']}.")
+    if tfr_params['time_anim_dpi'] <= 0:
+        raise ValueError(f"time_anim_dpi must be > 0, got {tfr_params['time_anim_dpi']}.")
     for band, (fmin, fmax) in tfr_params['bands'].items():
         if fmin < freqs.min() or fmax > freqs.max():
             raise ValueError(f"band {band!r} = ({fmin}, {fmax}) Hz falls outside the "
@@ -347,6 +432,15 @@ def check_tfr_params(params_dict, tfr_params, label=None, paths=None):
         print(f"  !! only {guard:g} s between the baseline and the cue, but the longest "
               f"analysis window is {longest:.2f} s: wavelets at the baseline edge reach "
               f"past t=0. Allow >= {longest / 2:.2f} s.")
+    # Not an error: overlapping bins are the normal way to read a time course off a TFR.
+    # But a grid of 20 columns invites being read as 20 measurements, so state the overlap
+    # with the real numbers rather than leaving it to be inferred from n_cycles.
+    if step < longest:
+        overlap = 100 * (1 - step / longest)
+        print(f"  !! time_grid_step = {step:g} s is shorter than the {longest:.2f} s "
+              f"analysis window, so adjacent columns of the binned grid share ~"
+              f"{overlap:.0f}% of their data. It is a smoothed time course sampled every "
+              f"{step:g} s, not {1 / step:.0f} independent samples per second.")
 
     if label is None and paths is not None:
         run_path = paths.tfrs / 'tfr_run.json'
@@ -407,7 +501,7 @@ def project_paths(root=None, label=None):
 
 
 def subject_figure_dir(subject, kind, paths=None):
-    """``Figures/<subject>/<kind>/``, created on demand. kind: 'ICA'|'TFR'|'Contrasts'."""
+    """``Figures/<subject>/<kind>/``, created on demand. kind: 'ICA'|'TFR'|'Contrasts'|'TimeBins'."""
     paths = paths or project_paths()
     out_dir = paths.figures / subject / kind
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -455,6 +549,13 @@ def default_params(electrode_group_names=ELECTRODE_GROUP_NAMES,
     params_dict = {}
     params_dict['PerformCsd'] = False           # CSD is applied after ICA, not here
     params_dict['PerformAvgRef'] = True
+    params_dict['PerformAsr'] = False           # ASR before ICA; see
+                                                # preprocessing.apply_asr
+    params_dict['asr_backend'] = 'asrpy'        # 'meegkit' for riemannian ASR
+    params_dict['asr_cutoff'] = 20
+    params_dict['asr_max_bad_chans'] = 0.1
+    params_dict['asr_method'] = 'euclid'
+    params_dict['asr_estimator'] = 'lwf'        # meegkit only; riemann needs it
     params_dict['CenterByClass'] = True         # per-class mean removal; this is what
                                                 # makes the TFRs induced power
 
@@ -506,7 +607,9 @@ def _cache_paths(subject, paths=None):
 # compares keys a meta actually recorded.
 _META_PARAM_KEYS = ('PerformCsd', 'PerformAvgRef', 'CenterByClass', 'filter_method',
                     'epoch_tmin', 'epoch_tmax', 'LowPass', 'HighPass', 'desired_events',
-                    'Electorde_Group', 'bad_electrodes')
+                    'Electorde_Group', 'bad_electrodes',
+                    'PerformAsr', 'asr_backend', 'asr_cutoff', 'asr_max_bad_chans',
+                    'asr_method', 'asr_estimator')
 
 
 def _meta_params(params_dict):
@@ -666,6 +769,15 @@ def fit_subject_ica(epochs, tfr_params=None):
     # One rank is lost to the average reference, so that is the ceiling by default.
     n_components = tfr_params.get('ica_n_components') or len(epochs.ch_names) - 1
 
+    # PerformAsr does NOT need a lower count than that. The worry would be that ASR,
+    # which rebuilds its rejected subspaces by projection, leaves the data below full
+    # rank and so hands FastICA more components than there is rank to support. It does
+    # not: measured on BA_MI1, the smallest relative singular value moves from 1e-12
+    # (the average reference's own null space) to 3e-8 with ASR on, i.e. the rank is
+    # 63 either way - different windows lose different subspaces, so globally the data
+    # still spans everything. Nothing to cap. (mne.compute_rank is no help here in any
+    # case: it reports 64 on both, missing even the average reference's lost rank.)
+
     print(f"Fitting ICA ({n_components} components, {tfr_params['ica_method']}, "
           f"seed {tfr_params['ica_random_state']}) on "
           f"{raw_from_epochs.n_times / raw_from_epochs.info['sfreq']:.0f} s of epoch data...")
@@ -735,6 +847,11 @@ def prepare_subject(subject, force=False, show=True, params_dict=None, tfr_param
         }, indent=1))
         cache.meta.write_text(json.dumps(
             _build_meta(subject, files, epochs, params_dict), indent=1))
+
+    if params_dict.get('PerformAsr'):
+        print(f"[{subject}] note: ASR ran before this ICA "
+              f"(cutoff {params_dict.get('asr_cutoff')} SD), so the components below "
+              f"were fitted on ASR-cleaned data.")
 
     suggested = iclabel_suggested_exclusions(label_dict['labels'],
                                              tfr_params['iclabel_exclude_labels'])
