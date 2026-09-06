@@ -5,6 +5,7 @@ import warnings
 warnings.filterwarnings('ignore')
 import logging
 import os,numpy as np,pandas as pd
+from scipy.signal import butter, sosfiltfilt
 from collections import OrderedDict
 import seaborn as sns
 from matplotlib import pyplot as plt
@@ -112,6 +113,90 @@ class PairwiseCSP(BaseEstimator, TransformerMixin):
         return np.hstack(features)
 
 
+DEFAULT_SFREQ = 500.0   # the XDF nominal_srate; nothing in this repo resamples
+
+# Filter banks for the 'fbrk+svm' pipeline (Zhang & Chen 2022, ITM Web Conf. 47 02013).
+# The epoch cache is built with a LowPass/HighPass band-pass already applied
+# (8-32 Hz by default), so a bank whose bands fall outside that range sees
+# attenuated noise: the paper's full 4-40 Hz bank needs LowPass=4 / HighPass=40,
+# which rebuilds the cache and, for the batch analyses, wants its own LABEL.
+FBRK_BANDS_INBAND = [[8, 12], [12, 16], [16, 20], [20, 24], [24, 28], [28, 32]]
+FBRK_BANDS_PAPER = [[4, 8], [8, 12], [12, 16], [16, 20], [20, 24],
+                    [24, 28], [28, 32], [32, 36], [36, 40]]
+
+
+class BandPassFilterBank(BaseEstimator, TransformerMixin):
+    """Split trials into a bank of bands: (trials, ch, times) -> (trials, ch, times, bands).
+
+    This is the filter-bank stage of FBRK-SVM, done INSIDE the sklearn pipeline
+    rather than in preprocessing. That matters for three reasons: every caller can
+    keep passing the ordinary 3-D array (the ``filter_bank_epochs`` route only ever
+    reached Main_Experiment, never the batch modules), a saved model carries its own
+    filters and so needs no extra live-loop step, and the transform is STATELESS -
+    ``fit`` learns nothing, so no fold can leak through it.
+
+    Zero-phase (``sosfiltfilt``), unlike the single band-pass in preprocessing, which
+    runs ``phase='forward'``. Zero-phase is the right call here because these are
+    already-cut epochs rather than a continuous recording: there is no causality
+    requirement, and the group delay of a causal filter would smear band-specific
+    latencies against each other.
+
+    Parameters
+    ----------
+    bands : list of [low, high] in Hz
+        Defaults to FBRK_BANDS_INBAND.
+    sfreq : float
+        Sampling rate of ``X``. Nothing here can infer it, and a wrong value silently
+        shifts every band, so callers must pass the real one.
+    order : int
+        Butterworth order per band. The paper uses 1; 4 matches this repo's own
+        band-pass, and with ``sosfiltfilt`` the effective order doubles.
+    """
+
+    def __init__(self, bands=None, sfreq=DEFAULT_SFREQ, order=4):
+        self.bands = bands
+        self.sfreq = sfreq
+        self.order = order
+
+    def _sos(self):
+        """One SOS filter per band, with the band checks stated in our own terms."""
+        bands = self.bands if self.bands is not None else FBRK_BANDS_INBAND
+        nyquist = float(self.sfreq) / 2.0
+        sos_per_band = []
+        for band in bands:
+            low, high = float(band[0]), float(band[1])
+            if not 0 < low < high < nyquist:
+                raise ValueError(
+                    f"band {band} is not 0 < low < high < nyquist ({nyquist} Hz at "
+                    f"sfreq={self.sfreq}). Check params_dict['fbrk_bands'] and 'sfreq'.")
+            sos_per_band.append(butter(self.order, [low, high], btype='bandpass',
+                                       fs=float(self.sfreq), output='sos'))
+        return sos_per_band
+
+    def fit(self, X, y=None):
+        self._sos()          # fail on a bad band at fit time, not mid-CV
+        return self
+
+    def transform(self, X):
+        X = np.asarray(X)
+        if X.ndim != 3:
+            raise ValueError(f"BandPassFilterBank expects (trials, channels, times), "
+                             f"got shape {X.shape}")
+        sos_per_band = self._sos()
+        # sosfiltfilt pads by 3 * (2 * n_sections + 1) samples at each end; a window
+        # shorter than that raises from inside scipy with nothing about our params in
+        # the message. The windowed runner predicts on 2 s slices, so this only fires
+        # on a misconfigured windowed_prediction_params['win_len'].
+        padlen = 3 * (2 * len(sos_per_band[0]) + 1)
+        if X.shape[2] <= padlen:
+            raise ValueError(
+                f"segments of {X.shape[2]} samples are too short for an order-"
+                f"{self.order} zero-phase filter (needs > {padlen}). At "
+                f"sfreq={self.sfreq} that is {padlen / float(self.sfreq):.2f} s; "
+                f"widen windowed_prediction_params['win_len'] or lower 'order'.")
+        return np.stack([sosfiltfilt(sos, X, axis=-1) for sos in sos_per_band], axis=-1)
+
+
 from braindecode.models import ShallowFBCSPNet
 from braindecode.training import CroppedLoss
 from braindecode.training.scoring import trial_preds_from_window_preds
@@ -181,6 +266,33 @@ class ShallowFBCSPNetWrapper:
         """Evaluate model accuracy."""
         preds = self.predict(X)
         return np.mean(preds == y)
+
+_BANDS_WARNED = set()
+
+
+def _warn_bands_outside_passband(bands, params_dict):
+    """Say so when a filter-bank band asks for frequencies the epochs no longer carry.
+
+    The epochs reaching any classifier are already band-passed to
+    [LowPass, HighPass] (preprocessing.EEG_Preprocessing), so a band outside that
+    range yields attenuated noise rather than an error - the exact failure that looks
+    like "the paper's bank just performs worse here". Prints rather than warns
+    (this module calls warnings.filterwarnings('ignore') at import), once per
+    configuration rather than once per fold.
+    """
+    low_pass, high_pass = params_dict.get('LowPass'), params_dict.get('HighPass')
+    if low_pass is None or high_pass is None:
+        return
+    outside = [band for band in bands
+               if band[0] < float(low_pass) or band[1] > float(high_pass)]
+    key = (tuple(map(tuple, outside)), low_pass, high_pass)
+    if outside and key not in _BANDS_WARNED:
+        _BANDS_WARNED.add(key)
+        print(f"WARNING: filter-bank bands {outside} fall outside the epochs' "
+              f"{low_pass}-{high_pass} Hz band-pass, so they carry attenuated noise. "
+              f"Set LowPass/HighPass to cover them (this rebuilds the epoch cache) "
+              f"or use bands inside the current pass-band.")
+
 
 def classifier_training(fold_train_data_x,fold_train_data_y,params_dict, BinaryClassification = False):
     #note that this is currently the  function that really does the classification and extracts the performance measure (the previous calls to run_lda.... for example, are just tests)
@@ -267,6 +379,42 @@ def classifier_training(fold_train_data_x,fold_train_data_y,params_dict, BinaryC
         fb=FilterBank(csp)
         #define the pipeline: 
         clf = Pipeline([('fbcsp',fb),('classifier_LDA',lda)])
+    elif curr_classifier_name=='fbrk+svm':
+        # FBRK-SVM, Zhang & Chen 2022 (ITM Web Conf. 47 02013): a bank of band-passes,
+        # an OAS-shrunk covariance per band, each projected to its own tangent space,
+        # the half-vectorised tangent vectors concatenated, then one SVM.
+        # Unlike 'fbcsp+lda' this takes the ordinary 3-D (trials, ch, times) array -
+        # BandPassFilterBank makes the 4th axis inside the pipeline - so it needs no
+        # filter_bank_epochs and works wherever classifier_training is called.
+        sfreq = float(params_dict.get('sfreq') or DEFAULT_SFREQ)
+        bands = params_dict.get('fbrk_bands') or FBRK_BANDS_INBAND
+        _warn_bands_outside_passband(bands, params_dict)
+        clf = Pipeline([
+            ('fbank', BandPassFilterBank(bands=bands, sfreq=sfreq)),
+            # pyriemann's TangentSpace IS the paper's Riemannian kernel: it whitens by
+            # the training set's Riemannian mean (the reference point C_t, eq. 7) and
+            # half-vectorises the matrix logarithm (eq. 8).
+            ('fbrk', FilterBank(make_pipeline(Covariances(estimator='oas'),
+                                              TangentSpace(metric='riemann')))),
+            ('scaler', StandardScaler()),
+            # SVC is one-vs-one internally, so no OneVsOneClassifier wrapper. Linear
+            # because the concatenated feature vector is n_bands * n_ch*(n_ch+1)/2
+            # wide - ~4000 for 36 channels and 6 bands - against a few hundred trials.
+            # In that regime the training folds come out perfectly separable, every
+            # sample is a support vector and the dual coefficients sit far below the
+            # box constraint, so svm_C is inert: sweeping it 0.01 -> 100 measurably
+            # changes nothing (identical coef_ and predictions). Narrow the feature
+            # count - fewer bands, fewer channels - before reaching for C. An rbf
+            # kernel scored worse than linear on every subject tried.
+            # probability=False keeps the fit cheap; decision_function still works,
+            # which is what the precision-recall plots use. Turn it on for a model
+            # destined for a live loop that reads predict_proba - it costs an internal
+            # 5-fold Platt calibration on every fit.
+            ('svm', SVC(kernel=params_dict.get('svm_kernel', 'linear'),
+                        C=params_dict.get('svm_C', 1.0),
+                        probability=params_dict.get('svm_probability', False),
+                        random_state=42)),
+        ])
     else: 
         raise Exception(f'the requested classifier is not defined in "run_windowed_classification_on_fold": {curr_classifier_name}')
     
@@ -425,6 +573,10 @@ def run_windowed_classification_aug_cv(epochs, epochs_cropped, cv_split, params_
 
     # Use sfreq from the object you actually window (epochs)
     sfreq = epochs.info['sfreq']
+    # Hand the real rate down: classifier_training only ever sees arrays, and
+    # 'fbrk+svm' needs sfreq to place its filter bank. Copy, never mutate - the
+    # caller's dict is shared across folds, subjects and modes.
+    params_dict = {**params_dict, 'sfreq': sfreq}
 
     # Window params in samples
     w_length = int(round(sfreq * win_len))
@@ -825,6 +977,10 @@ def run_full_epoch_classification_cv(epochs, epochs_cropped, cv_split, params_di
     win_step = float(windowed_prediction_params['win_step'])
 
     sfreq = epochs.info['sfreq']
+    # Hand the real rate down: classifier_training only ever sees arrays, and
+    # 'fbrk+svm' needs sfreq to place its filter bank. Copy, never mutate - the
+    # caller's dict is shared across folds, subjects and modes.
+    params_dict = {**params_dict, 'sfreq': sfreq}
     epoch_tmin = params_dict['epoch_tmin']
 
     epochs_data = epochs.get_data()
@@ -936,6 +1092,10 @@ def run_adaptive_cv(all_epochs, adaptive_block_epochs, cv_split, params_dict,
     sample_weight_all = compute_block_weights(block_counts, alpha=alpha)
 
     sfreq = all_epochs.info['sfreq']
+    # Hand the real rate down: classifier_training only ever sees arrays, and
+    # 'fbrk+svm' needs sfreq to place its filter bank. Copy, never mutate - the
+    # caller's dict is shared across folds, subjects and modes.
+    params_dict = {**params_dict, 'sfreq': sfreq}
     epoch_tmin = params_dict['epoch_tmin']
 
     epochs_data = all_epochs.get_data()
@@ -1074,6 +1234,10 @@ def run_trial_count_sweep_cv(epochs, epochs_cropped, cv_split, params_dict,
     win_step = float(windowed_prediction_params['win_step'])
 
     sfreq = epochs.info['sfreq']
+    # Hand the real rate down: classifier_training only ever sees arrays, and
+    # 'fbrk+svm' needs sfreq to place its filter bank. Copy, never mutate - the
+    # caller's dict is shared across folds, subjects and modes.
+    params_dict = {**params_dict, 'sfreq': sfreq}
     epoch_tmin = params_dict['epoch_tmin']
 
     epochs_data = epochs.get_data()
